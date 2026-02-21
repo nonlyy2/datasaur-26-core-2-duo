@@ -481,10 +481,9 @@ func findBestManager(pool []*Manager, segment string, ai AIResult, city string) 
 	return winner
 }
 
-func routeTicket(t TicketInput, ai AIResult) (*Manager, string, string) {
+func routeTicket(t TicketInput, ai AIResult) (*Manager, string) {
 	// AI уже определил ближайший офис — используем его напрямую
 	targetOffice := ai.NearestOffice
-	routeReason := "AI-гео"
 
 	isKazakhstan := t.Country == "" ||
 		strings.Contains(strings.ToLower(t.Country), "казахстан") ||
@@ -499,8 +498,7 @@ func routeTicket(t TicketInput, ai AIResult) (*Manager, string, string) {
 			targetOffice = "Алматы"
 		}
 		foreignSplitCtr++
-		routeReason = "50/50 (неизвест./зарубеж)"
-		fmt.Printf("   🌍 '%s' → %s [%s]\n", t.RawCity, targetOffice, routeReason)
+		fmt.Printf("   🌍 '%s' → %s (50/50)\n", t.RawCity, targetOffice)
 	} else {
 		fmt.Printf("   📍 AI: '%s' → офис '%s'\n", t.RawCity, targetOffice)
 	}
@@ -508,7 +506,7 @@ func routeTicket(t TicketInput, ai AIResult) (*Manager, string, string) {
 	// Шаг 1: Целевой офис
 	if pool, ok := ManagersMap[targetOffice]; ok {
 		if winner := findBestManager(pool, t.Segment, ai, targetOffice); winner != nil {
-			return winner, targetOffice, routeReason
+			return winner, targetOffice
 		}
 		fmt.Printf("   🔼 В '%s' нет подходящего → эскалация в ГО\n", targetOffice)
 	}
@@ -520,14 +518,14 @@ func routeTicket(t TicketInput, ai AIResult) (*Manager, string, string) {
 		}
 		if pool, ok := ManagersMap[hq]; ok {
 			if winner := findBestManager(pool, t.Segment, ai, hq); winner != nil {
-				fmt.Printf("   🔼 Эскалировано → %s (ГО)\n", hq)
-				return winner, hq + " (ГО)", "Эскалация"
+				fmt.Printf("   🔼 Эскалировано → %s\n", hq)
+				return winner, hq
 			}
 		}
 	}
 
 	fmt.Printf("   ❌ Нет менеджера ни в одном офисе\n")
-	return nil, "Не найден", "Ошибка"
+	return nil, "—"
 }
 
 // ========== ОСНОВНАЯ ОБРАБОТКА ==========
@@ -606,11 +604,9 @@ func processAllTickets(fp, apiKey string) {
 
 	if needHeader {
 		writer.Write([]string{
-			"GUID", "Город_оригинал", "Область", "Страна", "Сегмент",
-			"Текст", "AI_Тип", "AI_Тональность", "AI_Язык", "AI_Приоритет",
-			"AI_Summary", "AI_Офис",
-			"Назначенный_Менеджер", "Должность", "Офис_назначения",
-			"Причина_роутинга",
+			"GUID", "Область", "Сегмент", "Текст",
+			"Тип", "Тональность", "Язык", "Приоритет", "Рекомендации менеджеру",
+			"Назначенный Менеджер", "Должность", "Офис Назначения",
 		})
 		writer.Flush()
 	}
@@ -663,29 +659,29 @@ func processAllTickets(fp, apiKey string) {
 		if ai.Type == "Спам" {
 			fmt.Printf("   🚫 Спам — без назначения менеджера\n")
 			writer.Write([]string{
-				t.GUID, t.RawCity, t.Oblast, t.Country, t.Segment,
+				t.GUID, t.Oblast, t.Segment,
 				t.Text, ai.Type, ai.Sentiment, ai.Language, ai.Priority,
-				ai.Summary, ai.NearestOffice,
-				"—", "—", "N/A (Спам)", "Спам (без назначения)",
+				ai.Summary,
+				"—", "—", "—",
 			})
 			writer.Flush()
 			continue
 		}
 
 		// Роутинг
-		winner, assignedOffice, routeReason := routeTicket(t, ai)
+		winner, assignedOffice := routeTicket(t, ai)
 		managerName, managerRole := "Не найден", "—"
 		if winner != nil {
 			managerName = winner.Name
 			managerRole = winner.Role
-			fmt.Printf("   🎯 %s (%s) → %s [%s]\n", managerName, managerRole, assignedOffice, routeReason)
+			fmt.Printf("   🎯 %s (%s) → %s\n", managerName, managerRole, assignedOffice)
 		}
 
 		writer.Write([]string{
-			t.GUID, t.RawCity, t.Oblast, t.Country, t.Segment,
+			t.GUID, t.Oblast, t.Segment,
 			t.Text, ai.Type, ai.Sentiment, ai.Language, ai.Priority,
-			ai.Summary, ai.NearestOffice,
-			managerName, managerRole, assignedOffice, routeReason,
+			ai.Summary,
+			managerName, managerRole, assignedOffice,
 		})
 		writer.Flush()
 	}
