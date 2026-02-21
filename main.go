@@ -51,7 +51,7 @@ type TicketInput struct {
 // AIResult — результат AI-анализа одного тикета
 type AIResult struct {
 	Type          string // Жалоба | Смена данных | Консультация | Претензия | Неработоспособность приложения | Мошеннические действия | Спам
-	Sentiment     string // Positive | Neutral | Negative | Legal Risk
+	Sentiment     string // Позитивный | Нейтральный | Негативный
 	Language      string // RU | KZ | ENG
 	Priority      string // "1"-"10"
 	Summary       string // Краткая выжимка + рекомендация
@@ -382,7 +382,7 @@ func fallbackAnalyze(t TicketInput) AIResult {
 
 	r := AIResult{
 		Type:          "Консультация",
-		Sentiment:     "Neutral",
+		Sentiment:     "Нейтральный",
 		Language:      "RU",
 		Priority:      "5",
 		Summary:       "Keyword-анализ. Требуется проверка менеджером.",
@@ -418,27 +418,28 @@ func fallbackAnalyze(t TicketInput) AIResult {
 	case containsAny(text, "суд", "прокуратура", "адвокат", "иск", "court", "lawyer",
 		"правоохранительные органы", "заявление в", "следственный"):
 		r.Type = "Претензия"
-		r.Sentiment = "Legal Risk"
+		r.Sentiment = "Негативный"
 		r.Priority = "10"
 		r.Summary = "Клиент угрожает обращением в правоохранительные органы или суд. Немедленная эскалация Главному специалисту."
 
 	case containsAny(text, "мошенник", "украли", "взлом", "несанкционированн", "fraud",
 		"scam", "мошеннические", "финансовые махинации"):
 		r.Type = "Мошеннические действия"
-		r.Sentiment = "Negative"
+		r.Sentiment = "Негативный"
 		r.Priority = "9"
 		r.Summary = "Подозрение на мошенничество или несанкционированные действия. Срочно в отдел безопасности."
 
 	case containsAny(text, "верните", "возврат", "компенсация", "возместите", "refund",
 		"не пришло", "не на моем счету", "списали"):
 		r.Type = "Претензия"
-		r.Sentiment = "Negative"
+		r.Sentiment = "Негативный"
 		r.Priority = "8"
 		r.Summary = "Требование возврата средств. Запросить детали транзакции и подтверждающие документы."
 
 	case containsAny(text, "смена номера", "изменить данные", "паспорт", "реквизиты",
 		"смена данных", "изменить номер", "персональные данные", "удалить мои данные"):
 		r.Type = "Смена данных"
+		r.Sentiment = "Нейтральный"
 		r.Priority = "6"
 		r.Summary = "Запрос на изменение персональных данных. Запросить документы для верификации."
 
@@ -446,13 +447,14 @@ func fallbackAnalyze(t TicketInput) AIResult {
 		"ошибка", "crash", "error", "blocked", "заблокирован", "блокирован",
 		"пароль не принимает", "смс не приходит", "код не приходит"):
 		r.Type = "Неработоспособность приложения"
+		r.Sentiment = "Негативный"
 		r.Priority = "6"
 		r.Summary = "Технический сбой при входе или работе с приложением. Запросить ОС, версию приложения и скриншоты."
 
 	case containsAny(text, "недоволен", "ужасно", "безобразие", "отвратительно", "terrible",
 		"мошеннич", "ведете себя как"):
 		r.Type = "Жалоба"
-		r.Sentiment = "Negative"
+		r.Sentiment = "Негативный"
 		r.Priority = "7"
 		r.Summary = "Негативная оценка сервиса. Выслушать, принести извинения, предложить решение."
 
@@ -461,7 +463,7 @@ func fallbackAnalyze(t TicketInput) AIResult {
 		"ПЕРВОУРАЛЬСКБАНК", "московская биржа", "safelinks", "enkod.ru"):
 		r.Type = "Спам"
 		r.Priority = "1"
-		r.Sentiment = "Neutral"
+		r.Sentiment = "Нейтральный"
 		r.Summary = "Входящее сообщение классифицировано как рекламная рассылка."
 	}
 
@@ -515,15 +517,16 @@ func analyzeBatch(tickets []TicketInput, apiKey string) (map[int]AIResult, error
 
 ПРАВИЛА КЛАССИФИКАЦИИ:
 - type (ТОЛЬКО одно из): "Жалоба" | "Смена данных" | "Консультация" | "Претензия" | "Неработоспособность приложения" | "Мошеннические действия" | "Спам"
-- sentiment: "Positive" | "Neutral" | "Negative" | "Legal Risk"
-  • "Legal Risk" — если клиент угрожает судом, прокуратурой, полицией, правоохранителями
-  • "Negative" — если явное недовольство, но без юридических угроз
+- sentiment (ТОЛЬКО одно из): "Позитивный" | "Нейтральный" | "Негативный"
+  • "Негативный" — недовольство, жалоба, угроза судом/правоохранителями, требование возврата, мошенничество
+  • "Позитивный" — благодарность, похвала сервису
+  • "Нейтральный" — вопрос, консультация, запрос информации, смена данных
 - language: "RU" | "KZ" | "ENG"
   • KZ — казахский язык (саламатсыздарма, менде, рахмет, қате, бұйрық и т.п.)
   • ENG — английский язык
   • Если язык не определён → "RU"
 - priority: целое число 1–10 (10 = максимальная срочность)
-  • Legal Risk → 10, Мошеннические действия → 9, VIP-угрозы → 8+, Спам → 1
+  • Угроза судом/правоохранителями → 10, Мошеннические действия → 9, Претензия → 8, Жалоба → 6-7, Спам → 1
 - summary (для НЕ-спама): 1–2 предложения на русском — суть обращения + конкретная рекомендация менеджеру
 - summary (для Спама): только краткое описание, без рекомендации
 - nearest_office: определи ближайший офис из СПИСКА ВЫШЕ по полям country/oblast/city
@@ -692,8 +695,8 @@ func findBestManager(pool []*Manager, segment string, ai AIResult, officeKey str
 	var filtered []*Manager
 
 	for _, m := range pool {
-		// ── Фильтр 1: VIP/Priority сегмент ИЛИ высокий приоритет ИЛИ Legal Risk → нужен навык VIP
-		if needsVIP(segment) || isHighPriority(ai.Priority) || ai.Sentiment == "Legal Risk" {
+		// ── Фильтр 1: VIP/Priority сегмент ИЛИ высокий приоритет → нужен навык VIP
+		if needsVIP(segment) || isHighPriority(ai.Priority) {
 			hasVIP := false
 			for _, s := range m.Skills {
 				if strings.TrimSpace(s) == "VIP" {
@@ -810,7 +813,7 @@ func routeTicket(t TicketInput, ai AIResult) (*Manager, string) {
 // buildNoMatchReason — формирует читаемую причину отсутствия подходящего менеджера
 func buildNoMatchReason(segment string, ai AIResult) string {
 	var reasons []string
-	if needsVIP(segment) || isHighPriority(ai.Priority) || ai.Sentiment == "Legal Risk" {
+	if needsVIP(segment) || isHighPriority(ai.Priority) {
 		reasons = append(reasons, "нужен VIP")
 	}
 	if ai.Type == "Смена данных" {
