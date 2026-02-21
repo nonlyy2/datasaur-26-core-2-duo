@@ -8,11 +8,13 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"os"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/joho/godotenv"
@@ -78,6 +80,7 @@ type RoutingResult struct {
 	RoutingReason  string // Причина_роутинга
 	GeoMethod      string // Метод геокодирования
 	Source         string // AI_Источник: Gemini | Fallback
+	IsEscalated    bool   // Был ли тикет эскалирован в ГО
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -92,7 +95,6 @@ type GeoPoint struct {
 
 var (
 	ManagersMap     = make(map[string][]*Manager)
-	OfficesMap      = make(map[string]string) // Офис → Адрес
 	RRCounters      = make(map[string]int)
 	foreignSplitCtr int
 	HQ_CITIES       = []string{"Астана", "Алматы"}
@@ -193,14 +195,23 @@ CREATE TABLE IF NOT EXISTS routing_results (
     manager_name    VARCHAR(255),
     manager_role    VARCHAR(100),
     assigned_office VARCHAR(100),
+    is_escalated    BOOLEAN DEFAULT FALSE,
+    routing_reason  TEXT,
+    city_original   VARCHAR(200),
     routed_at       TIMESTAMP DEFAULT NOW()
 );
+
+-- Миграция: добавляем колонки если таблица уже существовала без них
+ALTER TABLE routing_results ADD COLUMN IF NOT EXISTS is_escalated   BOOLEAN DEFAULT FALSE;
+ALTER TABLE routing_results ADD COLUMN IF NOT EXISTS routing_reason TEXT;
+ALTER TABLE routing_results ADD COLUMN IF NOT EXISTS city_original  VARCHAR(200);
 
 -- Представление для удобного просмотра всей цепочки
 CREATE OR REPLACE VIEW v_full_results AS
 SELECT
     t.guid,
     t.city,
+    r.city_original,
     t.segment,
     t.description,
     a.type        AS ai_type,
@@ -209,9 +220,12 @@ SELECT
     a.priority    AS ai_priority,
     a.summary     AS ai_summary,
     a.source      AS ai_source,
+    a.geo_method  AS geo_method,
     r.manager_name,
     r.manager_role,
-    r.assigned_office
+    r.assigned_office,
+    r.is_escalated,
+    r.routing_reason
 FROM tickets t
 LEFT JOIN ai_analysis a ON a.guid = t.guid
 LEFT JOIN routing_results r ON r.guid = t.guid;
@@ -235,7 +249,7 @@ func saveTicketToDB(t TicketInput) {
 		t.Segment, t.Country, t.Oblast, t.RawCity, t.Street, t.House,
 	)
 	if err != nil {
-		log.Printf("⚠️ DB tickets insert %s: %v", t.GUID[:8], err)
+		log.Printf("⚠️ DB tickets insert %s: %v", t.GUID[:min(8, len(t.GUID))], err)
 	}
 }
 
@@ -244,7 +258,7 @@ func saveAIResultToDB(guid string, ai AIResult) {
 		return
 	}
 	priority, _ := strconv.Atoi(ai.Priority)
-	var lat, lon interface{}
+	var lat, lon any
 	if ai.GeoLat != 0 || ai.GeoLon != 0 {
 		lat, lon = ai.GeoLat, ai.GeoLon
 	}
@@ -260,7 +274,7 @@ func saveAIResultToDB(guid string, ai AIResult) {
 		lat, lon, ai.GeoMethod,
 	)
 	if err != nil {
-		log.Printf("⚠️ DB ai_analysis insert %s: %v", guid[:8], err)
+		log.Printf("⚠️ DB ai_analysis insert %s: %v", guid[:min(8, len(guid))], err)
 	}
 }
 
@@ -269,15 +283,17 @@ func saveRoutingToDB(guid string, r RoutingResult) {
 		return
 	}
 	_, err := db.Exec(`
-		INSERT INTO routing_results (guid, manager_name, manager_role, assigned_office)
-		VALUES ($1,$2,$3,$4)
+		INSERT INTO routing_results (guid, manager_name, manager_role, assigned_office, is_escalated, routing_reason, city_original)
+		VALUES ($1,$2,$3,$4,$5,$6,$7)
 		ON CONFLICT (guid) DO UPDATE SET
 			manager_name=EXCLUDED.manager_name, manager_role=EXCLUDED.manager_role,
-			assigned_office=EXCLUDED.assigned_office`,
+			assigned_office=EXCLUDED.assigned_office, is_escalated=EXCLUDED.is_escalated,
+			routing_reason=EXCLUDED.routing_reason, city_original=EXCLUDED.city_original`,
 		guid, r.ManagerName, r.ManagerRole, r.AssignedOffice,
+		r.IsEscalated, r.RoutingReason, r.CityOriginal,
 	)
 	if err != nil {
-		log.Printf("⚠️ DB routing_results insert %s: %v", guid[:8], err)
+		log.Printf("⚠️ DB routing_results insert %s: %v", guid[:min(8, len(guid))], err)
 	}
 }
 
@@ -302,10 +318,9 @@ func loadOffices(fp string) {
 			continue
 		}
 		city := strings.TrimSpace(strings.TrimPrefix(row[0], "\uFEFF"))
-		OfficesMap[city] = strings.TrimSpace(row[1])
 		knownOffices = append(knownOffices, city)
 	}
-	fmt.Printf("✅ Офисов загружено: %d → %v\n", len(OfficesMap), knownOffices)
+	fmt.Printf("✅ Офисов загружено: %d → %v\n", len(knownOffices), knownOffices)
 }
 
 func loadManagers(fp string) {
@@ -385,16 +400,6 @@ func containsAny(s string, words ...string) bool {
 	return false
 }
 
-// isValidOffice — проверяет, что офис существует в нашем списке
-func isValidOffice(office string) bool {
-	for _, o := range knownOffices {
-		if strings.EqualFold(o, strings.TrimSpace(office)) {
-			return true
-		}
-	}
-	return false
-}
-
 // normalizeOfficeName — возвращает точное название офиса с правильным регистром
 func normalizeOfficeName(office string) string {
 	office = strings.TrimSpace(office)
@@ -419,74 +424,13 @@ func normalizeOfficeName(office string) string {
 
 // haversine — расстояние между двумя точками в километрах
 func haversine(lat1, lon1, lat2, lon2 float64) float64 {
-	const R = 6371.0 // радиус Земли, км
-	dLat := (lat2 - lat1) * 3.14159265358979 / 180
-	dLon := (lon2 - lon1) * 3.14159265358979 / 180
-	lat1R := lat1 * 3.14159265358979 / 180
-	lat2R := lat2 * 3.14159265358979 / 180
-
-	a := sinSquared(dLat/2) + sinSquared(dLon/2)*cos(lat1R)*cos(lat2R)
-	c := 2 * atan2(sqrt(a), sqrt(1-a))
-	return R * c
-}
-
-// Вспомогательные математические функции (избегаем import "math" для простоты)
-func sinSquared(x float64) float64 { s := sin(x); return s * s }
-
-func sin(x float64) float64 {
-	// Вычисление sin через ряд Тейлора (достаточно для нашей точности)
-	x = x - float64(int(x/(2*3.14159265358979)))*2*3.14159265358979
-	result := x
-	term := x
-	for i := 1; i <= 10; i++ {
-		term *= -x * x / float64((2*i)*(2*i+1))
-		result += term
-	}
-	return result
-}
-
-func cos(x float64) float64 { return sin(x + 3.14159265358979/2) }
-
-func sqrt(x float64) float64 {
-	if x <= 0 {
-		return 0
-	}
-	z := x / 2
-	for i := 0; i < 50; i++ {
-		z -= (z*z - x) / (2 * z)
-	}
-	return z
-}
-
-func atan2(y, x float64) float64 {
-	if x > 0 {
-		return atan(y / x)
-	} else if x < 0 && y >= 0 {
-		return atan(y/x) + 3.14159265358979
-	} else if x < 0 && y < 0 {
-		return atan(y/x) - 3.14159265358979
-	} else if x == 0 && y > 0 {
-		return 3.14159265358979 / 2
-	} else if x == 0 && y < 0 {
-		return -3.14159265358979 / 2
-	}
-	return 0
-}
-
-func atan(x float64) float64 {
-	if x < 0 {
-		return -atan(-x)
-	}
-	if x > 1 {
-		return 3.14159265358979/2 - atan(1/x)
-	}
-	result := x
-	term := x
-	for i := 1; i <= 20; i++ {
-		term *= -x * x
-		result += term / float64(2*i+1)
-	}
-	return result
+	const R = 6371.0
+	dLat := (lat2 - lat1) * math.Pi / 180
+	dLon := (lon2 - lon1) * math.Pi / 180
+	a := math.Sin(dLat/2)*math.Sin(dLat/2) +
+		math.Cos(lat1*math.Pi/180)*math.Cos(lat2*math.Pi/180)*
+			math.Sin(dLon/2)*math.Sin(dLon/2)
+	return R * 2 * math.Atan2(math.Sqrt(a), math.Sqrt(1-a))
 }
 
 // findNearestOfficeByCoords — ближайший офис по координатам (Haversine)
@@ -695,6 +639,15 @@ func fallbackAnalyze(t TicketInput) AIResult {
 //  БАТЧ AI АНАЛИЗ — один запрос на все тикеты
 // ═══════════════════════════════════════════════════════════
 
+// getString — безопасно извлекает строку из map[string]any.
+// При null или отсутствии поля возвращает пустую строку вместо "<nil>".
+func getString(m map[string]any, key string) string {
+	if v, ok := m[key].(string); ok {
+		return v
+	}
+	return ""
+}
+
 type ticketForPrompt struct {
 	Index   int    `json:"i"`
 	Text    string `json:"text"`
@@ -805,10 +758,15 @@ func analyzeBatch(tickets []TicketInput, apiKey string) (map[int]AIResult, error
 SUMMARY (поле "summary"):
 ═══════════════════════════════════════════════════════
 1–2 предложения: суть обращения + рекомендация менеджеру.
-ВАЖНО: язык summary должен совпадать с языком обращения:
-  — если language="KZ" → summary пиши на казахском языке
-  — если language="ENG" → summary write in English
-  — если language="RU" → summary на русском
+ОБЯЗАТЕЛЬНОЕ ПРАВИЛО ЯЗЫКА SUMMARY — нарушение = ошибка:
+  — если language="KZ" → summary пиши ТОЛЬКО на казахском языке (қазақ тілінде)
+  — если language="ENG" → summary write ONLY in English
+  — если language="RU"  → summary пиши ТОЛЬКО на русском
+
+ПРИМЕРЫ ПРАВИЛЬНОГО SUMMARY:
+  language="KZ": "Клиент қосымшаға кіре алмайды, SMS коды келмейді. Техникалық мәселені тексеріп, кодты қайта жіберіп, клиентке хабарласыңыз."
+  language="ENG": "Client is unable to access the application due to a technical error. Verify account status and resend the verification SMS."
+  language="RU": "Клиент не может войти в приложение — SMS-код не приходит. Проверить статус аккаунта и отправить код повторно."
 
 ═══════════════════════════════════════════════════════
 ГЕОЛОКАЦИЯ (nearest_office):
@@ -843,11 +801,11 @@ SUMMARY (поле "summary"):
 ТИКЕТЫ (поле segment передаётся для учёта при расчёте приоритета):
 %s`, officesList, string(ticketsJSON))
 
-	body, _ := json.Marshal(map[string]interface{}{
-		"contents": []map[string]interface{}{
-			{"parts": []map[string]interface{}{{"text": prompt}}},
+	body, _ := json.Marshal(map[string]any{
+		"contents": []map[string]any{
+			{"parts": []map[string]any{{"text": prompt}}},
 		},
-		"generationConfig": map[string]interface{}{
+		"generationConfig": map[string]any{
 			"temperature":     0.05,
 			"maxOutputTokens": 8192,
 		},
@@ -907,8 +865,8 @@ SUMMARY (поле "summary"):
 		rawText = rawText[start : end+1]
 	}
 
-	// Парсинг через interface{} — устойчиво к типу priority (число или строка)
-	var rawResults []map[string]interface{}
+	// Парсинг через any — устойчиво к типу priority (число или строка)
+	var rawResults []map[string]any
 	if err := json.Unmarshal([]byte(rawText), &rawResults); err != nil {
 		return nil, fmt.Errorf("парсинг JSON результатов: %v\nОтвет AI (первые 600 символов): %.600s", err, rawText)
 	}
@@ -946,11 +904,11 @@ SUMMARY (поле "summary"):
 		}
 
 		results[idx] = AIResult{
-			Type:          fmt.Sprintf("%v", item["type"]),
-			Sentiment:     fmt.Sprintf("%v", item["sentiment"]),
-			Language:      fmt.Sprintf("%v", item["language"]),
+			Type:          getString(item, "type"),
+			Sentiment:     getString(item, "sentiment"),
+			Language:      getString(item, "language"),
 			Priority:      priority,
-			Summary:       fmt.Sprintf("%v", item["summary"]),
+			Summary:       getString(item, "summary"),
 			NearestOffice: nearestOffice,
 			Source:        "Gemini",
 		}
@@ -1048,8 +1006,8 @@ func findBestManager(pool []*Manager, segment string, ai AIResult, officeKey str
 
 // routeTicket — полный каскад роутинга согласно ТЗ
 // Геокодирование уже выполнено: ai.NearestOffice содержит финальный офис, ai.GeoMethod — метод.
-// Возвращает: менеджер, назначенный офис
-func routeTicket(t TicketInput, ai AIResult) (*Manager, string) {
+// Возвращает: менеджер, назначенный офис, флаг эскалации в ГО
+func routeTicket(t TicketInput, ai AIResult) (*Manager, string, bool) {
 	isKazakhstan := t.Country == "" ||
 		strings.Contains(strings.ToLower(t.Country), "казахстан") ||
 		strings.EqualFold(t.Country, "kz") ||
@@ -1085,7 +1043,7 @@ func routeTicket(t TicketInput, ai AIResult) (*Manager, string) {
 	// ── Шаг 2: Поиск менеджера в целевом офисе ───────────────
 	if pool, ok := ManagersMap[targetOffice]; ok {
 		if winner := findBestManager(pool, t.Segment, ai, targetOffice); winner != nil {
-			return winner, targetOffice
+			return winner, targetOffice, false
 		}
 		noMatchReason := buildNoMatchReason(t.Segment, ai)
 		fmt.Printf("   🔼 В '%s' нет подходящего менеджера (%s) → эскалация в ГО\n", targetOffice, noMatchReason)
@@ -1101,14 +1059,14 @@ func routeTicket(t TicketInput, ai AIResult) (*Manager, string) {
 		if pool, ok := ManagersMap[hq]; ok {
 			if winner := findBestManager(pool, t.Segment, ai, hq); winner != nil {
 				fmt.Printf("   🔼 Эскалировано в ГО → %s (%s)\n", hq, winner.Name)
-				return winner, hq
+				return winner, hq, true
 			}
 		}
 	}
 
 	// ── Шаг 4: Менеджер не найден ────────────────────────────
 	fmt.Printf("   ❌ Менеджер не найден ни в одном офисе\n")
-	return nil, "—"
+	return nil, "—", false
 }
 
 // buildNoMatchReason — формирует читаемую причину отсутствия подходящего менеджера
@@ -1130,14 +1088,14 @@ func buildNoMatchReason(segment string, ai AIResult) string {
 }
 
 // buildRoutingReason — формирует читаемую причину успешного роутинга
-func buildRoutingReason(segment string, ai AIResult, office, geoMethod string) string {
+func buildRoutingReason(segment string, ai AIResult, geoMethod string) string {
 	var parts []string
 	switch geoMethod {
 	case "nominatim":
 		parts = append(parts, "Geo:Nominatim+Haversine")
 	case "llm":
 		parts = append(parts, "Geo:LLM")
-	case "50/50":
+	case "50/50", "foreign", "unknown":
 		parts = append(parts, "Geo:50/50")
 	}
 	if needsVIP(segment) {
@@ -1159,6 +1117,70 @@ func buildRoutingReason(segment string, ai AIResult, office, geoMethod string) s
 // ═══════════════════════════════════════════════════════════
 //  ОСНОВНАЯ ОБРАБОТКА ТИКЕТОВ
 // ═══════════════════════════════════════════════════════════
+
+// ═══════════════════════════════════════════════════════════
+//  ПАРАЛЛЕЛЬНОЕ ГЕОКОДИРОВАНИЕ — кэш + rate limiter
+// ═══════════════════════════════════════════════════════════
+
+// geocodeAllParallel геокодирует все тикеты параллельно.
+// Соблюдает ограничение Nominatim (1 req/sec) через тикер.
+// Одинаковые адреса обслуживаются из кэша без повторных запросов.
+func geocodeAllParallel(tickets []TicketInput, aiResults map[int]AIResult) {
+	cache := make(map[string]struct {
+		office, method string
+		lat, lon       float64
+	})
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+
+	// Nominatim: не более 1 запроса в секунду
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+
+	fmt.Printf("🌐 Геокодирование %d тикетов (rate limit 1 req/sec, с кэшем)...\n", len(tickets))
+
+	for i := range tickets {
+		t := tickets[i]
+		ai := aiResults[t.Index]
+		cacheKey := t.Country + "|" + t.Oblast + "|" + t.RawCity + "|" + t.Street + "|" + t.House
+
+		mu.Lock()
+		if hit, ok := cache[cacheKey]; ok {
+			// Адрес уже геокодирован — берём из кэша
+			ai.GeoLat, ai.GeoLon, ai.GeoMethod = hit.lat, hit.lon, hit.method
+			if hit.office != "" {
+				ai.NearestOffice = hit.office
+			}
+			aiResults[t.Index] = ai
+			mu.Unlock()
+			fmt.Printf("   💾 Кэш: '%s' → '%s'\n", t.RawCity, hit.office)
+			continue
+		}
+		mu.Unlock()
+
+		wg.Add(1)
+		go func(ticket TicketInput, llmOffice, key string, idx int) {
+			defer wg.Done()
+			<-ticker.C // ждём свой слот (1 req/sec)
+			office, lat, lon, method := resolveOfficeForTicket(ticket, llmOffice)
+
+			mu.Lock()
+			cache[key] = struct {
+				office, method string
+				lat, lon       float64
+			}{office, method, lat, lon}
+			a := aiResults[idx]
+			a.GeoLat, a.GeoLon, a.GeoMethod = lat, lon, method
+			if office != "" {
+				a.NearestOffice = office
+			}
+			aiResults[idx] = a
+			mu.Unlock()
+		}(t, ai.NearestOffice, cacheKey, t.Index)
+	}
+	wg.Wait()
+	fmt.Println("✅ Геокодирование завершено")
+}
 
 func processAllTickets(fp, apiKey string) {
 	file, err := os.Open(fp)
@@ -1259,6 +1281,11 @@ func processAllTickets(fp, apiKey string) {
 			"Назначенный Менеджер",
 			"Должность",
 			"Офис Назначения",
+			"Эскалирован",
+			"Город_оригинал",
+			"Причина_роутинга",
+			"AI_Источник",
+			"Метод_гео",
 		})
 		writer.Flush()
 	}
@@ -1296,11 +1323,15 @@ func processAllTickets(fp, apiKey string) {
 		}
 	}
 
-	// ── РОУТИНГ + ЗАПИСЬ ──────────────────────────────────────────
-	fmt.Println("\n📋 Геокодирование и роутинг тикетов...")
+	// ── ФАЗА 1: Параллельное геокодирование (кэш + 1 req/sec) ───────
+	geocodeAllParallel(tickets, aiResults)
+
+	// ── ФАЗА 2: Роутинг + запись ─────────────────────────────────────
+	fmt.Println("\n📋 Роутинг тикетов...")
 	fmt.Println(strings.Repeat("─", 70))
 
 	var allResults []RoutingResult
+	var dbWg sync.WaitGroup // DB saves идут асинхронно, не блокируя CSV
 
 	for _, t := range tickets {
 		ai := aiResults[t.Index]
@@ -1309,22 +1340,9 @@ func processAllTickets(fp, apiKey string) {
 			shortGUID = t.GUID[:8]
 		}
 
-		fmt.Printf("\n[%d/%d] %s | Город: %s | Сегмент: %s | Тип: %s | Приоритет: %s | LLM-офис: '%s'\n",
-			t.Index+1, len(tickets), shortGUID, t.RawCity, t.Segment, ai.Type, ai.Priority, ai.NearestOffice)
-
-		// ── Геокодирование: обогащаем AIResult координатами ──────────
-		resolvedOffice, geoLat, geoLon, geoMethod := resolveOfficeForTicket(t, ai.NearestOffice)
-		ai.GeoLat = geoLat
-		ai.GeoLon = geoLon
-		ai.GeoMethod = geoMethod
-		if resolvedOffice != "" {
-			ai.NearestOffice = resolvedOffice
-		}
-		aiResults[t.Index] = ai
-
-		// Сохраняем тикет в PostgreSQL (с координатами)
-		saveTicketToDB(t)
-		saveAIResultToDB(t.GUID, ai)
+		fmt.Printf("\n[%d/%d] %s | %s | %s | приор.%s | офис:'%s' [%s]\n",
+			t.Index+1, len(tickets), shortGUID, t.RawCity, ai.Type, ai.Priority,
+			ai.NearestOffice, ai.GeoMethod)
 
 		var routingResult RoutingResult
 
@@ -1346,16 +1364,16 @@ func processAllTickets(fp, apiKey string) {
 				RoutingReason:  "Спам — менеджер не назначается",
 				GeoMethod:      ai.GeoMethod,
 				Source:         ai.Source,
+				IsEscalated:    false,
 			}
 		} else {
-			// Роутинг
-			winner, assignedOffice := routeTicket(t, ai)
+			winner, assignedOffice, isEscalated := routeTicket(t, ai)
 			managerName, managerRole := "Не найден", "—"
 			routingReason := buildNoMatchReason(t.Segment, ai)
 			if winner != nil {
 				managerName = winner.Name
 				managerRole = winner.Role
-				routingReason = buildRoutingReason(t.Segment, ai, assignedOffice, ai.GeoMethod)
+				routingReason = buildRoutingReason(t.Segment, ai, ai.GeoMethod)
 				fmt.Printf("   🎯 %s (%s) → офис %s\n", managerName, managerRole, assignedOffice)
 			} else {
 				fmt.Printf("   ❌ Менеджер не найден\n")
@@ -1376,13 +1394,26 @@ func processAllTickets(fp, apiKey string) {
 				RoutingReason:  routingReason,
 				GeoMethod:      ai.GeoMethod,
 				Source:         ai.Source,
+				IsEscalated:    isEscalated,
 			}
 		}
 
 		allResults = append(allResults, routingResult)
-		saveRoutingToDB(t.GUID, routingResult)
 
-		// Запись в CSV
+		// ── Async DB save: не блокируем роутинг следующего тикета ────
+		dbWg.Add(1)
+		go func(ticket TicketInput, aiSnap AIResult, rr RoutingResult) {
+			defer dbWg.Done()
+			saveTicketToDB(ticket)
+			saveAIResultToDB(ticket.GUID, aiSnap)
+			saveRoutingToDB(ticket.GUID, rr)
+		}(t, ai, routingResult)
+
+		// ── CSV write (последовательно — порядок важен) ───────────────
+		escalatedStr := "Нет"
+		if routingResult.IsEscalated {
+			escalatedStr = "Да"
+		}
 		writer.Write([]string{
 			routingResult.GUID,
 			routingResult.Segment,
@@ -1394,9 +1425,16 @@ func processAllTickets(fp, apiKey string) {
 			routingResult.ManagerName,
 			routingResult.ManagerRole,
 			routingResult.AssignedOffice,
+			escalatedStr,
+			routingResult.CityOriginal,
+			routingResult.RoutingReason,
+			routingResult.Source,
+			routingResult.GeoMethod,
 		})
 		writer.Flush()
 	}
+
+	dbWg.Wait() // Ждём завершения всех DB-горутин перед выходом
 
 	// ── Итоговая статистика ───────────────────────────────────────
 	printSummary(allResults)
@@ -1417,6 +1455,7 @@ func printSummary(results []RoutingResult) {
 	officeCounts := make(map[string]int)
 	noManager := 0
 	spam := 0
+	escalated := 0
 
 	for _, r := range results {
 		typeCounts[r.Type]++
@@ -1428,10 +1467,14 @@ func printSummary(results []RoutingResult) {
 		if r.Type == "Спам" {
 			spam++
 		}
+		if r.IsEscalated {
+			escalated++
+		}
 	}
 
 	fmt.Printf("  Всего обработано: %d\n", len(results))
 	fmt.Printf("  Спам:             %d\n", spam)
+	fmt.Printf("  Эскалировано в ГО:%d\n", escalated)
 	fmt.Printf("  Без менеджера:    %d\n", noManager)
 
 	fmt.Println("\n  Типы обращений:")
@@ -1448,17 +1491,6 @@ func printSummary(results []RoutingResult) {
 	for o, c := range officeCounts {
 		fmt.Printf("    %-30s %d\n", o, c)
 	}
-}
-
-// ═══════════════════════════════════════════════════════════
-//  ВСПОМОГАТЕЛЬНЫЕ
-// ═══════════════════════════════════════════════════════════
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -1518,9 +1550,6 @@ func main() {
 		fmt.Printf("  %s %-20s %d менеджеров, %d с VIP\n", flag, city, len(mgrs), vipCount)
 	}
 	fmt.Println()
-
-	// Небольшая пауза перед запуском
-	time.Sleep(200 * time.Millisecond)
 
 	// Основная обработка
 	processAllTickets(ticketsPath, apiKey)
