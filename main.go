@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"encoding/base64"
 	"encoding/csv"
 	"encoding/json"
 	"fmt"
@@ -10,7 +9,6 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -19,7 +17,7 @@ import (
 	"github.com/joho/godotenv"
 )
 
-// --- 1. СТРУКТУРЫ ДАННЫХ ---
+// ========== СТРУКТУРЫ ДАННЫХ ==========
 
 type Manager struct {
 	Name     string
@@ -29,34 +27,51 @@ type Manager struct {
 	Workload int
 }
 
-type AIResult struct {
-	Type      string `json:"type"`
-	Sentiment string `json:"sentiment"`
-	Language  string `json:"language"`
-	Priority  string `json:"priority"`
+// TicketInput — входные данные тикета
+type TicketInput struct {
+	Index      int
+	GUID       string
+	Text       string
+	Attachment string
+	Segment    string
+	Country    string
+	Oblast     string
+	RawCity    string
 }
 
-// Глобальные переменные (In-Memory БД)
-var (
-	ManagersMap = make(map[string][]*Manager)
-	OfficesMap  = make(map[string]string)
-	RRCount     int
+// AIResult — результат анализа одного тикета
+type AIResult struct {
+	Type          string // Жалоба, Консультация, Претензия и т.д.
+	Sentiment     string // Positive, Neutral, Negative, Legal Risk
+	Language      string // RU, KZ, ENG
+	Priority      string // "1"-"10"
+	Summary       string // Краткая выжимка + рекомендация
+	NearestOffice string // 🆕 LLM сам определяет ближайший офис по адресу
+}
 
-	// Главный офис для эскалации (fallback)
-	HQ_CITY = "Астана"
+// ========== ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ==========
+
+var (
+	ManagersMap     = make(map[string][]*Manager)
+	OfficesMap      = make(map[string]string) // Офис → Адрес
+	RRCounters      = make(map[string]int)
+	foreignSplitCtr int
+	HQ_CITIES       = []string{"Астана", "Алматы"}
 )
 
-// --- 2. ЗАГРУЗКА ДАННЫХ ---
+// knownOffices — список офисов для промпта (заполняется после loadOffices)
+var knownOffices []string
+
+// ========== ЗАГРУЗКА ДАННЫХ ==========
 
 func loadOffices(fp string) {
 	file, err := os.Open(fp)
 	if err != nil {
-		log.Fatalf("Ошибка открытия файла офисов: %v", err)
+		log.Fatalf("Ошибка открытия офисов: %v", err)
 	}
 	defer file.Close()
 
-	reader := csv.NewReader(file)
-	records, err := reader.ReadAll()
+	records, err := csv.NewReader(file).ReadAll()
 	if err != nil {
 		log.Fatalf("Ошибка чтения CSV офисов: %v", err)
 	}
@@ -65,20 +80,21 @@ func loadOffices(fp string) {
 		if i == 0 || len(row) < 2 {
 			continue
 		}
-		OfficesMap[strings.TrimSpace(row[0])] = strings.TrimSpace(row[1])
+		city := strings.TrimSpace(strings.TrimPrefix(row[0], "\uFEFF"))
+		OfficesMap[city] = strings.TrimSpace(row[1])
+		knownOffices = append(knownOffices, city)
 	}
-	fmt.Printf("✅ Загружено офисов: %d\n", len(OfficesMap))
+	fmt.Printf("✅ Офисов: %d → %v\n", len(OfficesMap), knownOffices)
 }
 
 func loadManagers(fp string) {
 	file, err := os.Open(fp)
 	if err != nil {
-		log.Fatalf("Ошибка открытия файла менеджеров: %v", err)
+		log.Fatalf("Ошибка открытия менеджеров: %v", err)
 	}
 	defer file.Close()
 
-	reader := csv.NewReader(file)
-	records, err := reader.ReadAll()
+	records, err := csv.NewReader(file).ReadAll()
 	if err != nil {
 		log.Fatalf("Ошибка чтения CSV менеджеров: %v", err)
 	}
@@ -87,192 +103,229 @@ func loadManagers(fp string) {
 		if i == 0 || len(row) < 5 {
 			continue
 		}
-
 		rawSkills := strings.Split(row[3], ",")
-		var cleanSkills []string
+		var skills []string
 		for _, s := range rawSkills {
-			cleanSkills = append(cleanSkills, strings.TrimSpace(s))
+			skills = append(skills, strings.TrimSpace(s))
 		}
-
 		workload, _ := strconv.Atoi(strings.TrimSpace(row[4]))
 		office := strings.TrimSpace(row[2])
-
-		manager := &Manager{
-			Name:     strings.TrimSpace(row[0]),
+		m := &Manager{
+			Name:     strings.TrimSpace(strings.TrimPrefix(row[0], "\uFEFF")),
 			Role:     strings.TrimSpace(strings.TrimPrefix(row[1], "\uFEFF")),
 			Office:   office,
-			Skills:   cleanSkills,
+			Skills:   skills,
 			Workload: workload,
 		}
-
-		ManagersMap[office] = append(ManagersMap[office], manager)
+		ManagersMap[office] = append(ManagersMap[office], m)
 	}
-
-	totalManagers := 0
-	for _, mgrs := range ManagersMap {
-		totalManagers += len(mgrs)
+	total := 0
+	for _, v := range ManagersMap {
+		total += len(v)
 	}
-	fmt.Printf("✅ Загружено менеджеров: %d (по %d городам)\n", totalManagers, len(ManagersMap))
+	fmt.Printf("✅ Менеджеров: %d по %d офисам\n", total, len(ManagersMap))
 }
 
-// --- 3. AI-АНАЛИЗ ---
+// ========== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==========
 
-// 🆕 ФОЛБЭК: если Gemini API упал — анализируем по ключевым словам
-func fallbackAnalyze(text string) *AIResult {
-	lower := strings.ToLower(text)
+func isHighPriority(priority string) bool {
+	p, err := strconv.Atoi(strings.TrimSpace(priority))
+	if err != nil {
+		return strings.EqualFold(priority, "high")
+	}
+	return p >= 7
+}
 
-	result := &AIResult{
-		Type:      "Консультация",
-		Sentiment: "Neutral",
-		Language:  "RU",
-		Priority:  "Medium",
+func needsVIP(segment string) bool {
+	s := strings.TrimSpace(segment)
+	return s == "VIP" || s == "Priority"
+}
+
+func containsAny(s string, words ...string) bool {
+	for _, w := range words {
+		if strings.Contains(s, w) {
+			return true
+		}
+	}
+	return false
+}
+
+// isValidOffice — проверяет, что LLM вернул реальный офис из нашего списка
+func isValidOffice(office string) bool {
+	for _, o := range knownOffices {
+		if strings.EqualFold(o, strings.TrimSpace(office)) {
+			return true
+		}
+	}
+	return false
+}
+
+// ========== KEYWORD FALLBACK ==========
+
+func fallbackAnalyze(t TicketInput) AIResult {
+	lower := strings.ToLower(t.Text)
+	r := AIResult{
+		Type:          "Консультация",
+		Sentiment:     "Neutral",
+		Language:      "RU",
+		Priority:      "5",
+		Summary:       "Keyword-анализ. Требуется проверка менеджером.",
+		NearestOffice: "", // При fallback гео — будет 50/50
 	}
 
-	// Определяем язык
-	kazWords := []string{"сіз", "өтінемін", "қате", "көмек", "банк"}
-	engWords := []string{"please", "help", "error", "account", "transfer", "unable"}
+	// Язык
 	kazCount, engCount := 0, 0
-	for _, w := range kazWords {
+	for _, w := range []string{"сіз", "өтінемін", "қате", "көмек", "рахмет", "жоқ", "болады"} {
 		if strings.Contains(lower, w) {
 			kazCount++
 		}
 	}
-	for _, w := range engWords {
+	for _, w := range []string{"please", "help", "error", "account", "transfer", "unable", "issue"} {
 		if strings.Contains(lower, w) {
 			engCount++
 		}
 	}
 	if kazCount >= 2 {
-		result.Language = "KZ"
+		r.Language = "KZ"
 	} else if engCount >= 2 {
-		result.Language = "ENG"
+		r.Language = "ENG"
 	}
 
-	// Определяем тип и тональность по ключевым словам
-	legalWords := []string{"суд", "прокуратура", "жалоба", "адвокат", "иск", "заявление", "court", "lawyer"}
-	for _, w := range legalWords {
-		if strings.Contains(lower, w) {
-			result.Sentiment = "Legal Risk"
-			result.Priority = "High"
-			result.Type = "Претензия"
-			return result
-		}
+	// Тип + приоритет
+	switch {
+	case containsAny(lower, "суд", "прокуратура", "адвокат", "иск", "court", "lawyer"):
+		r.Type, r.Sentiment, r.Priority = "Претензия", "Legal Risk", "10"
+		r.Summary = "Клиент угрожает судом. Немедленная эскалация Главному специалисту."
+	case containsAny(lower, "мошенник", "украли", "взлом", "несанкционированн", "fraud", "scam"):
+		r.Type, r.Sentiment, r.Priority = "Мошеннические действия", "Negative", "9"
+		r.Summary = "Подозрение на мошенничество. Срочно в отдел безопасности."
+	case containsAny(lower, "верните", "возврат", "компенсация", "возместите", "refund"):
+		r.Type, r.Sentiment, r.Priority = "Претензия", "Negative", "8"
+		r.Summary = "Требование возврата средств. Запросить детали транзакции."
+	case containsAny(lower, "недоволен", "ужасно", "безобразие", "отвратительно", "terrible"):
+		r.Type, r.Sentiment, r.Priority = "Жалоба", "Negative", "6"
+		r.Summary = "Негативная оценка сервиса. Выслушать и принести извинения."
+	case containsAny(lower, "не работает", "вылетает", "зависает", "ошибка", "crash", "error"):
+		r.Type, r.Priority = "Неработоспособность приложения", "6"
+		r.Summary = "Технический сбой. Запросить версию ОС и шаги воспроизведения."
+	case containsAny(lower, "смена", "изменить данные", "паспорт", "реквизиты"):
+		r.Type, r.Priority = "Смена данных", "5"
+		r.Summary = "Запрос на изменение данных. Запросить документы."
+	case containsAny(lower, "акция!", "выиграли", "поздравляем вы", "бесплатно!"):
+		r.Type, r.Priority = "Спам", "1"
+		r.Summary = "Входящее сообщение классифицировано как рекламная рассылка."
+	default:
+		r.Summary = "Клиент обращается за консультацией. Уточнить детали."
 	}
 
-	fraudWords := []string{"мошенник", "обман", "взлом", "украли", "несанкционированн", "fraud", "scam"}
-	for _, w := range fraudWords {
-		if strings.Contains(lower, w) {
-			result.Type = "Мошеннические действия"
-			result.Sentiment = "Highly Negative"
-			result.Priority = "High"
-			return result
-		}
-	}
-
-	pretensionWords := []string{"верните", "возврат", "компенсация", "возместите", "убытки", "refund"}
-	for _, w := range pretensionWords {
-		if strings.Contains(lower, w) {
-			result.Type = "Претензия"
-			result.Sentiment = "Negative"
-			result.Priority = "High"
-			return result
-		}
-	}
-
-	complaintWords := []string{"недоволен", "ужасно", "безобразие", "позор", "плохо", "отвратительно", "terrible"}
-	for _, w := range complaintWords {
-		if strings.Contains(lower, w) {
-			result.Type = "Жалоба"
-			result.Sentiment = "Negative"
-			result.Priority = "Medium"
-			return result
-		}
-	}
-
-	appWords := []string{"приложение", "не работает", "ошибка", "вылетает", "зависает", "баг", "app", "crash", "error"}
-	for _, w := range appWords {
-		if strings.Contains(lower, w) {
-			result.Type = "Неработоспособность приложения"
-			result.Priority = "Medium"
-			return result
-		}
-	}
-
-	dataWords := []string{"смените", "изменить", "обновить данные", "паспорт", "реквизиты", "адрес"}
-	for _, w := range dataWords {
-		if strings.Contains(lower, w) {
-			result.Type = "Смена данных"
-			return result
-		}
-	}
-
-	spamWords := []string{"акция!", "скидка", "выиграли", "поздравляем", "бесплатно", "promotion"}
-	for _, w := range spamWords {
-		if strings.Contains(lower, w) {
-			result.Type = "Спам"
-			result.Priority = "Low"
-			return result
-		}
-	}
-
-	return result
+	return r
 }
 
-func analyzeTicketText(text string, attachmentName string, apiKey string) (*AIResult, error) {
+// ========== БАТЧ AI АНАЛИЗ ==========
+
+func analyzeBatch(tickets []TicketInput, apiKey string) (map[int]AIResult, error) {
 	url := "https://generativelanguage.googleapis.com/v1beta/models/gemma-3-27b-it:generateContent?key=" + apiKey
 
-	prompt := "Ты - классификатор обращений. Верни ТОЛЬКО валидный JSON без маркдауна.\n" +
-		"Правила:\n" +
-		"- Если просто негатив -> Жалоба\n" +
-		"- Если клиент требует возврата средств или материального возмещения -> Претензия\n" +
-		"- Если клиент упоминает суд, прокуратуру, адвоката -> sentiment: Legal Risk, priority: High\n" +
-		"Структура JSON:\n" +
-		"{\n  \"type\": \"Жалоба | Смена данных | Консультация | Претензия | Неработоспособность приложения | Мошеннические действия | Спам\",\n" +
-		"  \"sentiment\": \"Positive | Neutral | Negative | Highly Negative | Legal Risk\",\n" +
-		"  \"language\": \"RU | KZ | ENG\",\n" +
-		"  \"priority\": \"High | Medium | Low\"\n}\n" +
-		"Текст: " + text
+	// Список офисов для промпта — LLM будет выбирать только из этого списка
+	officesList := strings.Join(knownOffices, " | ")
 
-	parts := []map[string]interface{}{
-		{"text": prompt},
+	// Формируем компактный JSON-массив тикетов
+	// Передаём все адресные поля — LLM сам разберётся с опечатками и нестандартными названиями
+	type ticketForPrompt struct {
+		Index   int    `json:"i"`
+		Text    string `json:"text"`
+		Country string `json:"country,omitempty"`
+		Oblast  string `json:"oblast,omitempty"`
+		City    string `json:"city,omitempty"`
 	}
 
-	if attachmentName != "" {
-		filePath := filepath.Join("data", "attachments", attachmentName)
-		imgData, err := os.ReadFile(filePath)
-		if err == nil {
-			base64Img := base64.StdEncoding.EncodeToString(imgData)
-			parts = append(parts, map[string]interface{}{
-				"inline_data": map[string]string{
-					"mime_type": "image/jpeg",
-					"data":      base64Img,
-				},
-			})
-			fmt.Printf(" [ИИ] Прикреплено изображение: %s\n", attachmentName)
-		} else {
-			fmt.Printf(" [ИИ] ⚠️ Вложение не найдено: %s\n", filePath)
+	var promptTickets []ticketForPrompt
+	for _, t := range tickets {
+		text := t.Text
+		if len(text) > 600 {
+			text = text[:600] + "..."
 		}
+		// Экранируем кавычки в тексте
+		text = strings.ReplaceAll(text, `"`, `'`)
+
+		promptTickets = append(promptTickets, ticketForPrompt{
+			Index:   t.Index,
+			Text:    text,
+			Country: t.Country,
+			Oblast:  t.Oblast,
+			City:    t.RawCity,
+		})
 	}
 
-	reqBodyBytes, _ := json.Marshal(map[string]interface{}{
+	ticketsJSON, _ := json.Marshal(promptTickets)
+
+	prompt := fmt.Sprintf(`Ты — аналитик клиентских обращений Freedom Broker (Казахстан). Обработай массив тикетов.
+
+СПИСОК ДОСТУПНЫХ ОФИСОВ (nearest_office — ТОЛЬКО из этого списка):
+%s
+
+ПРАВИЛА КЛАССИФИКАЦИИ:
+- Просто негатив → type: "Жалоба"
+- Требование возврата/компенсации → type: "Претензия"
+- Угроза судом/прокуратурой/адвокатом → sentiment: "Legal Risk", priority: 10
+- Реклама/рассылка → type: "Спам", priority: 1
+- Язык не определён → language: "RU"
+- priority: целое число 1-10 (10 = максимальная срочность)
+- summary для НЕ-спама: 1-2 предложения на русском — суть + рекомендация менеджеру
+- summary для Спама: только краткое описание без рекомендации (менеджер не назначается)
+- nearest_office: определи ближайший офис по полям country/oblast/city.
+  Учитывай опечатки, транслитерацию, исторические названия, пригороды.
+  Если клиент из другой страны или адрес совсем неизвестен → nearest_office: ""
+
+ВЕРНИ ТОЛЬКО JSON МАССИВ, без маркдауна и пояснений:
+[
+  {
+    "i": <число из входных данных>,
+    "type": "Жалоба | Смена данных | Консультация | Претензия | Неработоспособность приложения | Мошеннические действия | Спам",
+    "sentiment": "Positive | Neutral | Negative | Legal Risk",
+    "language": "RU | KZ | ENG",
+    "priority": <1-10>,
+    "summary": "<текст>",
+    "nearest_office": "<название офиса из списка выше или пустая строка>"
+  }
+]
+
+ТИКЕТЫ:
+%s`, officesList, string(ticketsJSON))
+
+	body, _ := json.Marshal(map[string]interface{}{
 		"contents": []map[string]interface{}{
-			{"parts": parts},
+			{"parts": []map[string]interface{}{{"text": prompt}}},
+		},
+		"generationConfig": map[string]interface{}{
+			"temperature":     0.1,
+			"maxOutputTokens": 8192,
 		},
 	})
 
-	resp, err := http.Post(url, "application/json", bytes.NewBuffer(reqBodyBytes))
+	fmt.Printf("📤 Батч: %d тикетов → 1 запрос к AI...\n", len(tickets))
+
+	resp, err := http.Post(url, "application/json", bytes.NewBuffer(body))
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("HTTP: %v", err)
 	}
 	defer resp.Body.Close()
 
-	// 🆕 Явная обработка Rate Limit (429)
 	if resp.StatusCode == 429 {
-		return nil, fmt.Errorf("rate limit (429): квота исчерпана")
+		return nil, fmt.Errorf("rate limit 429 — подождите 60 сек")
+	}
+	if resp.StatusCode != 200 {
+		b, _ := io.ReadAll(resp.Body)
+		snippet := string(b)
+		if len(snippet) > 300 {
+			snippet = snippet[:300]
+		}
+		return nil, fmt.Errorf("API %d: %s", resp.StatusCode, snippet)
 	}
 
-	bodyBytes, _ := io.ReadAll(resp.Body)
+	respBytes, _ := io.ReadAll(resp.Body)
 
+	// Стандартный парсинг ответа Gemini
 	var geminiResp struct {
 		Candidates []struct {
 			Content struct {
@@ -282,38 +335,104 @@ func analyzeTicketText(text string, attachmentName string, apiKey string) (*AIRe
 			} `json:"content"`
 		} `json:"candidates"`
 	}
-
-	if err := json.Unmarshal(bodyBytes, &geminiResp); err != nil {
-		return nil, fmt.Errorf("ошибка парсинга ответа: %v", err)
+	if err := json.Unmarshal(respBytes, &geminiResp); err != nil {
+		return nil, fmt.Errorf("парсинг ответа Gemini: %v", err)
 	}
-
 	if len(geminiResp.Candidates) == 0 || len(geminiResp.Candidates[0].Content.Parts) == 0 {
-		return nil, fmt.Errorf("пустой ответ от ИИ: %s", string(bodyBytes))
+		return nil, fmt.Errorf("пустой ответ от AI")
 	}
 
-	rawJSON := geminiResp.Candidates[0].Content.Parts[0].Text
-	rawJSON = strings.TrimPrefix(rawJSON, "```json\n")
-	rawJSON = strings.TrimPrefix(rawJSON, "```\n")
-	rawJSON = strings.TrimSuffix(rawJSON, "\n```")
-	rawJSON = strings.TrimSpace(rawJSON)
+	rawText := geminiResp.Candidates[0].Content.Parts[0].Text
 
-	var result AIResult
-	if err := json.Unmarshal([]byte(rawJSON), &result); err != nil {
-		return nil, fmt.Errorf("ошибка чтения JSON от ИИ: %v\nТекст ИИ: %s", err, rawJSON)
+	// Чистим markdown-обёртку
+	rawText = strings.TrimPrefix(rawText, "```json\n")
+	rawText = strings.TrimPrefix(rawText, "```json")
+	rawText = strings.TrimPrefix(rawText, "```\n")
+	rawText = strings.TrimSuffix(rawText, "\n```")
+	rawText = strings.TrimSuffix(rawText, "```")
+	rawText = strings.TrimSpace(rawText)
+
+	// Парсим массив через interface{} — устойчиво к типу priority (число или строка)
+	var rawResults []map[string]interface{}
+	if err := json.Unmarshal([]byte(rawText), &rawResults); err != nil {
+		// Пробуем найти JSON массив внутри текста
+		start := strings.Index(rawText, "[")
+		end := strings.LastIndex(rawText, "]")
+		if start >= 0 && end > start {
+			if err2 := json.Unmarshal([]byte(rawText[start:end+1]), &rawResults); err2 != nil {
+				return nil, fmt.Errorf("парсинг JSON: %v\nОтвет AI: %.500s", err2, rawText)
+			}
+		} else {
+			return nil, fmt.Errorf("JSON массив не найден: %.500s", rawText)
+		}
 	}
 
-	return &result, nil
+	results := make(map[int]AIResult)
+	for _, item := range rawResults {
+		// index — ключ "i"
+		indexRaw, ok := item["i"]
+		if !ok {
+			// fallback на "index" если LLM использовал полное имя
+			indexRaw, ok = item["index"]
+			if !ok {
+				continue
+			}
+		}
+		idx := int(indexRaw.(float64))
+
+		// priority — может быть float64 или string
+		priority := "5"
+		switch v := item["priority"].(type) {
+		case float64:
+			priority = strconv.Itoa(int(v))
+		case string:
+			if v != "" {
+				priority = v
+			}
+		}
+
+		// nearest_office — проверяем валидность
+		nearestOffice := ""
+		if raw, ok := item["nearest_office"].(string); ok {
+			raw = strings.TrimSpace(raw)
+			if isValidOffice(raw) {
+				nearestOffice = raw
+			} else if raw != "" {
+				// LLM вернул что-то похожее — пробуем нечёткое совпадение
+				for _, o := range knownOffices {
+					if strings.Contains(strings.ToLower(raw), strings.ToLower(o)) ||
+						strings.Contains(strings.ToLower(o), strings.ToLower(raw)) {
+						nearestOffice = o
+						break
+					}
+				}
+				if nearestOffice == "" {
+					fmt.Printf("   ⚠️ AI вернул неизвестный офис '%s' → 50/50\n", raw)
+				}
+			}
+		}
+
+		results[idx] = AIResult{
+			Type:          fmt.Sprintf("%v", item["type"]),
+			Sentiment:     fmt.Sprintf("%v", item["sentiment"]),
+			Language:      fmt.Sprintf("%v", item["language"]),
+			Priority:      priority,
+			Summary:       fmt.Sprintf("%v", item["summary"]),
+			NearestOffice: nearestOffice,
+		}
+	}
+
+	fmt.Printf("✅ Батч готов: %d/%d результатов\n", len(results), len(tickets))
+	return results, nil
 }
 
-// --- 4. РОУТИНГ ---
+// ========== РОУТИНГ ==========
 
-// findBestManager ищет подходящего менеджера в пуле конкретного города
-func findBestManager(pool []*Manager, segment string, aiResult *AIResult) *Manager {
+func findBestManager(pool []*Manager, segment string, ai AIResult, city string) *Manager {
 	var filtered []*Manager
-
 	for _, m := range pool {
-		// VIP / High Priority / Legal Risk → только VIP-навык
-		if segment == "VIP" || aiResult.Priority == "High" || aiResult.Sentiment == "Legal Risk" {
+		// VIP/Priority сегмент ИЛИ приоритет >= 7 ИЛИ Legal Risk → нужен VIP навык
+		if needsVIP(segment) || isHighPriority(ai.Priority) || ai.Sentiment == "Legal Risk" {
 			hasVIP := false
 			for _, s := range m.Skills {
 				if s == "VIP" {
@@ -325,17 +444,15 @@ func findBestManager(pool []*Manager, segment string, aiResult *AIResult) *Manag
 				continue
 			}
 		}
-
 		// Смена данных → только Главный специалист
-		if aiResult.Type == "Смена данных" && m.Role != "Главный специалист" {
+		if ai.Type == "Смена данных" && m.Role != "Главный специалист" {
 			continue
 		}
-
 		// Языковой фильтр
-		if aiResult.Language == "ENG" || aiResult.Language == "KZ" {
+		if ai.Language == "ENG" || ai.Language == "KZ" {
 			hasLang := false
 			for _, s := range m.Skills {
-				if s == aiResult.Language {
+				if s == ai.Language {
 					hasLang = true
 					break
 				}
@@ -344,216 +461,283 @@ func findBestManager(pool []*Manager, segment string, aiResult *AIResult) *Manag
 				continue
 			}
 		}
-
 		filtered = append(filtered, m)
 	}
-
 	if len(filtered) == 0 {
 		return nil
 	}
 
-	// Балансировка: Least Connections + Round Robin
+	// Least Connections + Round Robin топ-2
 	sort.Slice(filtered, func(i, j int) bool {
 		return filtered[i].Workload < filtered[j].Workload
 	})
-
 	candidates := filtered
 	if len(filtered) > 1 {
 		candidates = filtered[:2]
 	}
-
-	winner := candidates[RRCount%len(candidates)]
-	RRCount++
+	winner := candidates[RRCounters[city]%len(candidates)]
+	RRCounters[city]++
 	winner.Workload++
-
 	return winner
 }
 
-// 🆕 routeTicket с авто-эскалацией в главный офис
-func routeTicket(city string, segment string, aiResult *AIResult) (*Manager, string, error) {
-	// 1. Ищем в пуле города клиента
-	if pool, ok := ManagersMap[city]; ok {
-		if winner := findBestManager(pool, segment, aiResult); winner != nil {
-			return winner, city, nil
+func routeTicket(t TicketInput, ai AIResult) (*Manager, string, string) {
+	// AI уже определил ближайший офис — используем его напрямую
+	targetOffice := ai.NearestOffice
+	routeReason := "AI-гео"
+
+	isKazakhstan := t.Country == "" ||
+		strings.Contains(strings.ToLower(t.Country), "казахстан") ||
+		strings.EqualFold(t.Country, "kz") ||
+		strings.EqualFold(t.Country, "kazakhstan")
+
+	if targetOffice == "" || !isKazakhstan {
+		// AI не смог определить офис или клиент из-за рубежа → 50/50
+		if foreignSplitCtr%2 == 0 {
+			targetOffice = "Астана"
+		} else {
+			targetOffice = "Алматы"
 		}
-		// Подходящих нет в локальном офисе → эскалируем
-		fmt.Printf(" 🔼 ЭСКАЛАЦИЯ: в %s нет подходящего менеджера, направляем в %s\n", city, HQ_CITY)
+		foreignSplitCtr++
+		routeReason = "50/50 (неизвест./зарубеж)"
+		fmt.Printf("   🌍 '%s' → %s [%s]\n", t.RawCity, targetOffice, routeReason)
 	} else {
-		fmt.Printf(" 🌍 Город '%s' не в базе, направляем в %s\n", city, HQ_CITY)
+		fmt.Printf("   📍 AI: '%s' → офис '%s'\n", t.RawCity, targetOffice)
 	}
 
-	// 2. 🆕 Эскалация в главный офис (Астана)
-	if hqPool, ok := ManagersMap[HQ_CITY]; ok {
-		if winner := findBestManager(hqPool, segment, aiResult); winner != nil {
-			return winner, HQ_CITY + " (ГО)", nil
+	// Шаг 1: Целевой офис
+	if pool, ok := ManagersMap[targetOffice]; ok {
+		if winner := findBestManager(pool, t.Segment, ai, targetOffice); winner != nil {
+			return winner, targetOffice, routeReason
+		}
+		fmt.Printf("   🔼 В '%s' нет подходящего → эскалация в ГО\n", targetOffice)
+	}
+
+	// Шаг 2: Эскалация в ГО
+	for _, hq := range HQ_CITIES {
+		if hq == targetOffice {
+			continue
+		}
+		if pool, ok := ManagersMap[hq]; ok {
+			if winner := findBestManager(pool, t.Segment, ai, hq); winner != nil {
+				fmt.Printf("   🔼 Эскалировано → %s (ГО)\n", hq)
+				return winner, hq + " (ГО)", "Эскалация"
+			}
 		}
 	}
 
-	// 3. Если даже ГО не справился — ищем в Алматы
-	if almatyPool, ok := ManagersMap["Алматы"]; ok {
-		if winner := findBestManager(almatyPool, segment, aiResult); winner != nil {
-			return winner, "Алматы (ГО)", nil
-		}
-	}
-
-	return nil, "-", fmt.Errorf("нет подходящего менеджера ни в одном офисе для тикета из %s", city)
+	fmt.Printf("   ❌ Нет менеджера ни в одном офисе\n")
+	return nil, "Не найден", "Ошибка"
 }
 
-// --- 5. ОСНОВНАЯ ОБРАБОТКА ---
+// ========== ОСНОВНАЯ ОБРАБОТКА ==========
 
-func processAllTickets(fp string, apiKey string) {
+func processAllTickets(fp, apiKey string) {
 	file, err := os.Open(fp)
 	if err != nil {
-		log.Fatalf("Ошибка открытия tickets.csv: %v", err)
+		log.Fatalf("Ошибка tickets.csv: %v", err)
 	}
 	defer file.Close()
 
-	reader := csv.NewReader(file)
-	records, err := reader.ReadAll()
+	records, err := csv.NewReader(file).ReadAll()
 	if err != nil {
-		log.Fatalf("Ошибка чтения tickets.csv: %v", err)
+		log.Fatalf("Ошибка чтения: %v", err)
 	}
 
-	// Считаем уже обработанные строки (для продолжения с места остановки)
-	startFrom := 1 // 1 = пропускаем только заголовок по умолчанию
+	// Читаем уже обработанные GUIDы
+	processedGUIDs := make(map[string]bool)
 	needHeader := true
-
 	if existing, err := os.Open("data/results.csv"); err == nil {
-		r := csv.NewReader(existing)
-		rows, _ := r.ReadAll()
+		rows, _ := csv.NewReader(existing).ReadAll()
 		existing.Close()
 		if len(rows) > 1 {
-			// Уже есть данные — продолжаем с нужной строки
-			startFrom = len(rows) // rows включает заголовок
 			needHeader = false
-			fmt.Printf("📂 Найден results.csv с %d записями, продолжаем с позиции %d\n", len(rows)-1, startFrom)
+			for _, row := range rows[1:] {
+				if len(row) > 0 {
+					processedGUIDs[strings.TrimSpace(row[0])] = true
+				}
+			}
+			fmt.Printf("📂 Уже обработано: %d тикетов\n", len(processedGUIDs))
 		}
 	}
 
-	// 🔧 ФИКС: правильное открытие outFile с defer outFile.Close()
+	// Собираем необработанные тикеты
+	var tickets []TicketInput
+	for i, row := range records {
+		if i == 0 || len(row) < 9 {
+			continue
+		}
+		guid := strings.TrimSpace(row[0])
+		if processedGUIDs[guid] {
+			continue
+		}
+		text := strings.TrimSpace(row[3])
+		attach := strings.TrimSpace(row[4])
+		if text == "" && attach == "" {
+			continue
+		}
+		tickets = append(tickets, TicketInput{
+			Index:      len(tickets),
+			GUID:       guid,
+			Text:       text,
+			Attachment: attach,
+			Segment:    strings.TrimSpace(row[5]),
+			Country:    strings.TrimSpace(row[6]),
+			Oblast:     strings.TrimSpace(row[7]),
+			RawCity:    strings.TrimSpace(row[8]),
+		})
+	}
+
+	if len(tickets) == 0 {
+		fmt.Println("✅ Все тикеты уже обработаны.")
+		return
+	}
+	fmt.Printf("\n🚀 Необработанных тикетов: %d\n", len(tickets))
+
+	// Открываем выходной файл
 	outFile, err := os.OpenFile("data/results.csv", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
-		log.Fatal("Ошибка открытия results.csv:", err)
+		log.Fatal("Ошибка results.csv:", err)
 	}
-	defer outFile.Close() // ФИКС: было defer file.Close() — это баг!
+	defer outFile.Close()
 
 	writer := csv.NewWriter(outFile)
 	defer writer.Flush()
 
-	// Пишем заголовок только в новый файл
 	if needHeader {
 		writer.Write([]string{
-			"GUID", "Город", "Сегмент", "Текст",
-			"AI_Тип", "AI_Тональность", "AI_Язык", "AI_Приоритет",
-			"Назначенный_Менеджер", "Должность", "Офис_назначения", "AI_Источник",
+			"GUID", "Город_оригинал", "Область", "Страна", "Сегмент",
+			"Текст", "AI_Тип", "AI_Тональность", "AI_Язык", "AI_Приоритет",
+			"AI_Summary", "AI_Офис",
+			"Назначенный_Менеджер", "Должность", "Офис_назначения",
+			"Причина_роутинга",
 		})
+		writer.Flush()
 	}
 
-	limit := 20
-	count := 0
-	consecutiveErrors := 0
+	// ── БАТЧ AI АНАЛИЗ (1 запрос на всё) ─────────────────────────────────────
+	aiResults, batchErr := analyzeBatch(tickets, apiKey)
 
-	fmt.Printf("\n🚀 Начинаем обработку тикетов (пропускаем первые %d строк)...\n", startFrom)
-
-	for i, row := range records {
-		// ФИКС: правильный порядок проверок
-		if i == 0 {
-			continue // пропускаем заголовок CSV
+	if batchErr != nil {
+		fmt.Printf("⚠️ Батч ошибка: %v\n🔄 Keyword fallback для всех тикетов\n", batchErr)
+		aiResults = make(map[int]AIResult)
+		for _, t := range tickets {
+			aiResults[t.Index] = fallbackAnalyze(t)
 		}
-		if i < startFrom {
-			continue // пропускаем уже обработанные
-		}
-		if count >= limit {
-			break
-		}
-		if len(row) < 9 {
-			continue
-		}
-
-		guid := row[0]
-		text := row[3]
-		attachment := strings.TrimSpace(row[4])
-		segment := row[5]
-		city := row[8]
-
-		if strings.TrimSpace(text) == "" && attachment == "" {
-			continue
-		}
-
-		fmt.Printf("[%d/%d] Тикет: %s | Город: %s | Сегмент: %s\n",
-			count+1, limit, guid[:8], city, segment)
-
-		// 🆕 Пробуем AI, при ошибке — фолбэк на ключевые слова
-		aiSource := "Gemini"
-		aiResult, aiErr := analyzeTicketText(text, attachment, apiKey)
-		if aiErr != nil {
-			fmt.Printf(" ⚠️ Ошибка ИИ: %v\n", aiErr)
-			fmt.Printf(" 🔄 Переключаемся на keyword-фолбэк\n")
-			aiResult = fallbackAnalyze(text)
-			aiSource = "Fallback"
-			consecutiveErrors++
-
-			// Если 3+ ошибки подряд — ждём дольше
-			if consecutiveErrors >= 3 {
-				fmt.Printf(" ⏳ Много ошибок подряд, пауза 30 сек...\n")
-				time.Sleep(30 * time.Second)
-				consecutiveErrors = 0
+	} else {
+		// Fallback для тикетов, которые AI пропустил
+		for _, t := range tickets {
+			if _, ok := aiResults[t.Index]; !ok {
+				fmt.Printf("   ⚠️ AI пропустил тикет %d → fallback\n", t.Index)
+				aiResults[t.Index] = fallbackAnalyze(t)
 			}
-		} else {
-			consecutiveErrors = 0
+		}
+	}
+
+	// VIP / Priority сегмент → принудительно приоритет 10
+	for _, t := range tickets {
+		if needsVIP(t.Segment) {
+			if r, ok := aiResults[t.Index]; ok {
+				if r.Priority != "10" {
+					fmt.Printf("   👑 %s | сегмент %s → принудительный приоритет 10 (было %s)\n",
+						t.GUID[:8], t.Segment, r.Priority)
+					r.Priority = "10"
+					aiResults[t.Index] = r
+				}
+			}
+		}
+	}
+
+	// ── РОУТИНГ И ЗАПИСЬ ──────────────────────────────────────────────────────
+	fmt.Println("\n📋 Роутинг...")
+	for _, t := range tickets {
+		ai := aiResults[t.Index]
+		short := t.GUID
+		if len(t.GUID) > 8 {
+			short = t.GUID[:8]
+		}
+		fmt.Printf("\n[%d] %s | %s | %s | %s | p=%s | AI-офис: '%s'\n",
+			t.Index+1, short, t.RawCity, t.Segment, ai.Type, ai.Priority, ai.NearestOffice)
+
+		// ── СПАМ: сохраняем для аналитики, менеджер не назначается ──
+		if ai.Type == "Спам" {
+			fmt.Printf("   🚫 Спам — без назначения менеджера\n")
+			writer.Write([]string{
+				t.GUID, t.RawCity, t.Oblast, t.Country, t.Segment,
+				t.Text, ai.Type, ai.Sentiment, ai.Language, ai.Priority,
+				ai.Summary, ai.NearestOffice,
+				"—", "—", "N/A (Спам)", "Спам (без назначения)",
+			})
+			writer.Flush()
+			continue
 		}
 
-		// Роутинг с авто-эскалацией
-		winner, assignedOffice, routeErr := routeTicket(city, segment, aiResult)
-		managerName := "Не найден"
-		managerRole := "-"
-
-		if routeErr == nil {
+		// Роутинг
+		winner, assignedOffice, routeReason := routeTicket(t, ai)
+		managerName, managerRole := "Не найден", "—"
+		if winner != nil {
 			managerName = winner.Name
 			managerRole = winner.Role
-			fmt.Printf(" ✅ Назначен: %s (%s) → офис: %s\n", managerName, managerRole, assignedOffice)
-		} else {
-			fmt.Printf(" ❌ %v\n", routeErr)
-			assignedOffice = "Не найден"
+			fmt.Printf("   🎯 %s (%s) → %s [%s]\n", managerName, managerRole, assignedOffice, routeReason)
 		}
 
 		writer.Write([]string{
-			guid, city, segment, text,
-			aiResult.Type, aiResult.Sentiment, aiResult.Language, aiResult.Priority,
-			managerName, managerRole, assignedOffice, aiSource,
+			t.GUID, t.RawCity, t.Oblast, t.Country, t.Segment,
+			t.Text, ai.Type, ai.Sentiment, ai.Language, ai.Priority,
+			ai.Summary, ai.NearestOffice,
+			managerName, managerRole, assignedOffice, routeReason,
 		})
-
-		count++
-
-		// Пауза для обхода Rate Limit (только если использовали реальный AI)
-		if aiSource == "Gemini" {
-			time.Sleep(10 * time.Second)
-		}
+		writer.Flush()
 	}
 
-	fmt.Printf("\n✅ Готово! Обработано %d тикетов. Результаты в data/results.csv\n", count)
+	fmt.Printf("\n✅ Готово! Обработано %d тикетов → data/results.csv\n", len(tickets))
 }
 
-func main() {
-	err := godotenv.Load()
-	if err != nil {
-		log.Println("⚠️ Файл .env не найден")
-	}
+// ========== MAIN ==========
 
+func main() {
+	if err := godotenv.Load(); err != nil {
+		log.Println("⚠️ .env не найден")
+	}
 	apiKey := os.Getenv("GEMINI_API_KEY")
 	if apiKey == "" {
 		log.Fatal("❌ GEMINI_API_KEY не установлен!")
 	}
 
-	fmt.Println("🚀 FIRE Engine v2.0 запускается...")
+	fmt.Println("🔥 FIRE Engine v5.0")
+	fmt.Println("   ✅ AI-geo: LLM сам определяет офис (опечатки, транслитерация, пригороды)")
+	fmt.Println("   ✅ Батч-промпт: 1 запрос на все тикеты")
+	fmt.Println("   ✅ Спам: аналитика без назначения")
+	fmt.Println("   ✅ Priority segment = VIP-обслуживание")
+	fmt.Println("   ✅ Priority 1-10 + JSON fix")
+	fmt.Println("   ✅ Авто-эскалация + 50/50 split")
+	fmt.Println("   ✅ 0 хардкода адресов")
 
 	loadOffices("data/business_units.csv")
 	loadManagers("data/managers.csv")
 
-	fmt.Println("\n--- Проверка In-Memory БД ---")
-	if astanaMgrs, ok := ManagersMap["Астана"]; ok {
-		fmt.Printf("В Астане менеджеров: %d\n", len(astanaMgrs))
+	// Проверка: VIP-покрытие по офисам
+	fmt.Println("\n--- VIP-покрытие по офисам ---")
+	for _, city := range knownOffices {
+		mgrs := ManagersMap[city]
+		vip := 0
+		for _, m := range mgrs {
+			for _, s := range m.Skills {
+				if s == "VIP" {
+					vip++
+					break
+				}
+			}
+		}
+		flag := "✅"
+		if vip == 0 {
+			flag = "⚠️ НЕТ VIP!"
+		}
+		fmt.Printf("  %s %s: %d менеджеров, %d VIP\n", flag, city, len(mgrs), vip)
 	}
+
+	// Небольшая пауза перед запуском
+	time.Sleep(300 * time.Millisecond)
 
 	processAllTickets("data/tickets.csv", apiKey)
 }
