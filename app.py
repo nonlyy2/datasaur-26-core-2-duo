@@ -1,7 +1,8 @@
 import streamlit as st
 import pandas as pd
 import os
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 
 st.set_page_config(page_title="FIRE Dashboard", layout="wide", page_icon="🔥")
 
@@ -31,11 +32,9 @@ COL_MANAGER = "Назначенный Менеджер"
 COL_ROLE    = "Должность"
 COL_OFFICE  = "Офис Назначения"
 
-# Добавляем Язык если отсутствует (старые results.csv)
 if COL_LANG not in df.columns:
     df[COL_LANG] = "RU"
 
-# Уровень приоритета
 def prio_label(val):
     try:
         n = int(float(val))
@@ -137,18 +136,17 @@ show_cols = [c for c in [
 
 st.dataframe(
     fdf[show_cols].style.apply(highlight_row, axis=1),
-    use_container_width=True,
+    width='stretch',
     height=450
 )
 st.caption(f"Показано {len(fdf)} из {total} тикетов")
 
-# Блок эскалированных тикетов
 esc_df = df[df[COL_OFFICE].str.contains("ГО", na=False)]
 if not esc_df.empty:
     with st.expander(f"🔼 Эскалированные тикеты ({len(esc_df)} шт) — нажмите для просмотра"):
         esc_cols = [c for c in [COL_SEG, COL_TYPE, COL_PRIO, COL_MANAGER, COL_OFFICE]
                     if c in esc_df.columns]
-        st.dataframe(esc_df[esc_cols], use_container_width=True)
+        st.dataframe(esc_df[esc_cols], width='stretch')
 
 # ─── STAR TASK: AI АССИСТЕНТ ──────────────────────────────────────────────────
 st.markdown("---")
@@ -195,16 +193,23 @@ if user_input:
         if not gemini_api_key:
             answer = "⚠️ GEMINI_API_KEY не найден. Добавьте ключ в файл .env"
         else:
-            genai.configure(api_key=gemini_api_key)
-            model = genai.GenerativeModel("gemma-3-27b-it")
+            client = genai.Client(api_key=gemini_api_key)
 
-            history_for_gemini = []
+            # Собираем историю
+            history_contents = []
             for m in st.session_state.chat_history[:-1]:
                 role = "user" if m["role"] == "user" else "model"
-                history_for_gemini.append({"role": role, "parts": [m["content"]]})
+                history_contents.append(types.Content(role=role, parts=[types.Part(text=m["content"])]))
 
-            chat = model.start_chat(history=history_for_gemini)
-            response = chat.send_message(f"{system_prompt}\n\nВопрос: {user_input}")
+            history_contents.append(
+                types.Content(role="user", parts=[types.Part(text=f"{system_prompt}\n\nВопрос: {user_input}")])
+            )
+
+            response = client.models.generate_content(
+                model="gemma-3-27b-it",
+                contents=history_contents,
+                config=types.GenerateContentConfig(temperature=0.3, max_output_tokens=1024),
+            )
             answer = response.text
     except Exception as e:
         answer = f"⚠️ Ошибка AI-ассистента: {str(e)}"
