@@ -18,40 +18,22 @@ if not os.path.exists(data_path):
 df = pd.read_csv(data_path)
 
 # Колонки из main.go:
-# GUID, Город, Сегмент, Тип, Тональность, Язык, Приоритет,
-# Рекомендации менеджеру, Назначенный Менеджер, Должность,
-# Офис Назначения, Причина роутинга, Источник
+# GUID, Сегмент, Тип, Тональность, Язык, Приоритет,
+# Рекомендации менеджеру, Назначенный Менеджер, Должность, Офис Назначения
 
-# Алиасы для удобства
-COL_CITY      = "Город"
-COL_SEG       = "Сегмент"
-COL_TYPE      = "Тип"
-COL_SENT      = "Тональность"
-COL_LANG      = "Язык"
-COL_PRIO      = "Приоритет"
-COL_SUMMARY   = "Рекомендации менеджеру"
-COL_MANAGER   = "Назначенный Менеджер"
-COL_ROLE      = "Должность"
-COL_OFFICE    = "Офис Назначения"
-COL_REASON    = "Причина роутинга"
-COL_SOURCE    = "Источник"
+COL_SEG     = "Сегмент"
+COL_TYPE    = "Тип"
+COL_SENT    = "Тональность"
+COL_LANG    = "Язык"
+COL_PRIO    = "Приоритет"
+COL_SUMMARY = "Рекомендации менеджеру"
+COL_MANAGER = "Назначенный Менеджер"
+COL_ROLE    = "Должность"
+COL_OFFICE  = "Офис Назначения"
 
-# Проверяем наличие обязательных колонок
-required = [COL_CITY, COL_SEG, COL_TYPE, COL_SENT, COL_PRIO, COL_MANAGER, COL_OFFICE]
-missing = [c for c in required if c not in df.columns]
-if missing:
-    st.error(f"❌ Не найдены колонки: {missing}. Проверьте results.csv.")
-    st.stop()
-
-# Добавляем отсутствующие необязательные колонки с дефолтом
-for col, default in [
-    (COL_LANG,   "RU"),
-    (COL_SUMMARY, "—"),
-    (COL_REASON,  "—"),
-    (COL_SOURCE,  "Gemini"),
-]:
-    if col not in df.columns:
-        df[col] = default
+# Добавляем Язык если отсутствует (старые results.csv)
+if COL_LANG not in df.columns:
+    df[COL_LANG] = "RU"
 
 # Уровень приоритета
 def prio_label(val):
@@ -67,21 +49,19 @@ df["Приоритет_уровень"] = df[COL_PRIO].apply(prio_label)
 
 # ─── МЕТРИКИ ──────────────────────────────────────────────────────────────────
 st.subheader("📊 Оперативная сводка")
-c1, c2, c3, c4, c5, c6 = st.columns(6)
+c1, c2, c3, c4, c5 = st.columns(5)
 
-total        = len(df)
-vip_count    = len(df[df[COL_SEG].isin(["VIP", "Priority"])])
-spam_count   = len(df[df[COL_TYPE] == "Спам"])
-legal_count  = len(df[df[COL_SENT] == "Legal Risk"])
-esc_count    = len(df[df[COL_OFFICE].str.contains("ГО", na=False)])
-fallback_count = len(df[df[COL_SOURCE] == "Fallback"])
+total       = len(df)
+vip_count   = len(df[df[COL_SEG].isin(["VIP", "Priority"])])
+spam_count  = len(df[df[COL_TYPE] == "Спам"])
+legal_count = len(df[df[COL_SENT] == "Legal Risk"])
+esc_count   = len(df[df[COL_OFFICE].str.contains("ГО", na=False)])
 
-c1.metric("Всего тикетов",     total)
-c2.metric("VIP + Priority",    vip_count)
-c3.metric("🚨 Спам",           spam_count)
-c4.metric("⚖️ Legal Risk",     legal_count)
+c1.metric("Всего тикетов",        total)
+c2.metric("VIP + Priority",       vip_count)
+c3.metric("🚨 Спам",              spam_count)
+c4.metric("⚖️ Legal Risk",        legal_count)
 c5.metric("🔼 Эскалировано в ГО", esc_count)
-c6.metric("🔄 Keyword Fallback",  fallback_count)
 
 # ─── ГРАФИКИ ──────────────────────────────────────────────────────────────────
 st.markdown("---")
@@ -109,8 +89,8 @@ with col4:
         st.bar_chart(mgr_df[COL_MANAGER].value_counts().head(10))
 
 with col5:
-    st.subheader("Причины роутинга")
-    st.bar_chart(df[COL_REASON].value_counts())
+    st.subheader("Тональность обращений")
+    st.bar_chart(df[COL_SENT].value_counts())
 
 # ─── ФИЛЬТРЫ + ТАБЛИЦА ────────────────────────────────────────────────────────
 st.markdown("---")
@@ -118,19 +98,19 @@ st.subheader("📋 Детализация распределения")
 
 cf1, cf2, cf3, cf4 = st.columns(4)
 with cf1:
-    f_city = st.multiselect("🏙️ Город",          sorted(df[COL_CITY].dropna().unique()))
+    f_type = st.multiselect("📌 Тип обращения", sorted(df[COL_TYPE].dropna().unique()))
 with cf2:
-    f_type = st.multiselect("📌 Тип обращения",   sorted(df[COL_TYPE].dropna().unique()))
+    f_prio = st.multiselect("🔥 Приоритет",     ["High", "Medium", "Low"])
 with cf3:
-    f_prio = st.multiselect("🔥 Приоритет",       ["High", "Medium", "Low"])
+    f_seg  = st.multiselect("👤 Сегмент",        sorted(df[COL_SEG].dropna().unique()))
 with cf4:
-    f_seg  = st.multiselect("👤 Сегмент",         sorted(df[COL_SEG].dropna().unique()))
+    f_off  = st.multiselect("🏢 Офис",           sorted(df[COL_OFFICE].dropna().unique()))
 
 fdf = df.copy()
-if f_city: fdf = fdf[fdf[COL_CITY].isin(f_city)]
 if f_type: fdf = fdf[fdf[COL_TYPE].isin(f_type)]
 if f_prio: fdf = fdf[fdf["Приоритет_уровень"].isin(f_prio)]
 if f_seg:  fdf = fdf[fdf[COL_SEG].isin(f_seg)]
+if f_off:  fdf = fdf[fdf[COL_OFFICE].isin(f_off)]
 
 def highlight_row(row):
     styles = [""] * len(row)
@@ -150,9 +130,9 @@ def highlight_row(row):
     return styles
 
 show_cols = [c for c in [
-    COL_CITY, COL_OFFICE, COL_SEG, COL_TYPE, COL_SENT,
-    COL_LANG, COL_PRIO, "Приоритет_уровень", COL_SUMMARY,
-    COL_MANAGER, COL_ROLE, COL_REASON, COL_SOURCE
+    COL_SEG, COL_TYPE, COL_SENT, COL_LANG,
+    COL_PRIO, "Приоритет_уровень", COL_SUMMARY,
+    COL_MANAGER, COL_ROLE, COL_OFFICE
 ] if c in fdf.columns]
 
 st.dataframe(
@@ -166,7 +146,7 @@ st.caption(f"Показано {len(fdf)} из {total} тикетов")
 esc_df = df[df[COL_OFFICE].str.contains("ГО", na=False)]
 if not esc_df.empty:
     with st.expander(f"🔼 Эскалированные тикеты ({len(esc_df)} шт) — нажмите для просмотра"):
-        esc_cols = [c for c in [COL_CITY, COL_SEG, COL_TYPE, COL_PRIO, COL_MANAGER, COL_OFFICE]
+        esc_cols = [c for c in [COL_SEG, COL_TYPE, COL_PRIO, COL_MANAGER, COL_OFFICE]
                     if c in esc_df.columns]
         st.dataframe(esc_df[esc_cols], use_container_width=True)
 
@@ -182,7 +162,7 @@ for msg in st.session_state.chat_history:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
 
-user_input = st.chat_input("Например: Покажи распределение типов обращений по городам")
+user_input = st.chat_input("Например: Покажи распределение типов обращений по офисам")
 
 if user_input:
     st.session_state.chat_history.append({"role": "user", "content": user_input})
@@ -239,6 +219,5 @@ with st.expander("💡 Примеры вопросов к ассистенту")
 - Какой тип обращений встречается чаще всего?
 - Покажи статистику по Legal Risk тикетам
 - Какой менеджер получил больше всего тикетов?
-- Сколько тикетов было обработано через keyword fallback?
 - Какой процент тикетов получил приоритет High?
     """)

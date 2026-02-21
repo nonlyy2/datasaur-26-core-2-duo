@@ -1250,7 +1250,6 @@ func processAllTickets(fp, apiKey string) {
 	if needHeader {
 		writer.Write([]string{
 			"GUID",
-			"Город",
 			"Сегмент",
 			"Тип",
 			"Тональность",
@@ -1260,8 +1259,6 @@ func processAllTickets(fp, apiKey string) {
 			"Назначенный Менеджер",
 			"Должность",
 			"Офис Назначения",
-			"Причина роутинга",
-			"Источник",
 		})
 		writer.Flush()
 	}
@@ -1388,7 +1385,6 @@ func processAllTickets(fp, apiKey string) {
 		// Запись в CSV
 		writer.Write([]string{
 			routingResult.GUID,
-			routingResult.CityOriginal,
 			routingResult.Segment,
 			routingResult.Type,
 			routingResult.Sentiment,
@@ -1398,8 +1394,6 @@ func processAllTickets(fp, apiKey string) {
 			routingResult.ManagerName,
 			routingResult.ManagerRole,
 			routingResult.AssignedOffice,
-			routingResult.RoutingReason,
-			routingResult.Source,
 		})
 		writer.Flush()
 	}
