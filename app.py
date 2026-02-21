@@ -1,7 +1,6 @@
 import streamlit as st
 import pandas as pd
 import os
-import json
 import google.generativeai as genai
 
 st.set_page_config(page_title="FIRE Dashboard", layout="wide", page_icon="🔥")
@@ -18,48 +17,71 @@ if not os.path.exists(data_path):
 
 df = pd.read_csv(data_path)
 
-# Обратная совместимость со старым форматом
-if "Офис_назначения" not in df.columns:
-    df["Офис_назначения"] = df.get("Город", "—")
-if "AI_Источник" not in df.columns:
-    df["AI_Источник"] = "Gemini"
-if "AI_Summary" not in df.columns:
-    df["AI_Summary"] = "—"
-if "Причина_роутинга" not in df.columns:
-    df["Причина_роутинга"] = "—"
+# Колонки из main.go:
+# GUID, Город, Сегмент, Тип, Тональность, Язык, Приоритет,
+# Рекомендации менеджеру, Назначенный Менеджер, Должность,
+# Офис Назначения, Причина роутинга, Источник
 
-# Конвертируем приоритет в число, если пришёл в числовом виде
+# Алиасы для удобства
+COL_CITY      = "Город"
+COL_SEG       = "Сегмент"
+COL_TYPE      = "Тип"
+COL_SENT      = "Тональность"
+COL_LANG      = "Язык"
+COL_PRIO      = "Приоритет"
+COL_SUMMARY   = "Рекомендации менеджеру"
+COL_MANAGER   = "Назначенный Менеджер"
+COL_ROLE      = "Должность"
+COL_OFFICE    = "Офис Назначения"
+COL_REASON    = "Причина роутинга"
+COL_SOURCE    = "Источник"
+
+# Проверяем наличие обязательных колонок
+required = [COL_CITY, COL_SEG, COL_TYPE, COL_SENT, COL_PRIO, COL_MANAGER, COL_OFFICE]
+missing = [c for c in required if c not in df.columns]
+if missing:
+    st.error(f"❌ Не найдены колонки: {missing}. Проверьте results.csv.")
+    st.stop()
+
+# Добавляем отсутствующие необязательные колонки с дефолтом
+for col, default in [
+    (COL_LANG,   "RU"),
+    (COL_SUMMARY, "—"),
+    (COL_REASON,  "—"),
+    (COL_SOURCE,  "Gemini"),
+]:
+    if col not in df.columns:
+        df[col] = default
+
+# Уровень приоритета
 def prio_label(val):
     try:
         n = int(float(val))
-        if n >= 8:
-            return "High"
-        elif n >= 5:
-            return "Medium"
-        else:
-            return "Low"
+        if n >= 8:   return "High"
+        elif n >= 5: return "Medium"
+        else:        return "Low"
     except:
         return str(val)
 
-df["Приоритет_уровень"] = df["AI_Приоритет"].apply(prio_label)
+df["Приоритет_уровень"] = df[COL_PRIO].apply(prio_label)
 
 # ─── МЕТРИКИ ──────────────────────────────────────────────────────────────────
 st.subheader("📊 Оперативная сводка")
 c1, c2, c3, c4, c5, c6 = st.columns(6)
 
-total = len(df)
-vip_count = len(df[df["Сегмент"].isin(["VIP", "Priority"])])
-spam_count = len(df[df["AI_Тип"] == "Спам"])
-legal_count = len(df[df["AI_Тональность"] == "Legal Risk"])
-esc_count = len(df[df["Офис_назначения"].str.contains("ГО", na=False)])
-fallback_count = len(df[df["AI_Источник"] == "Fallback"])
+total        = len(df)
+vip_count    = len(df[df[COL_SEG].isin(["VIP", "Priority"])])
+spam_count   = len(df[df[COL_TYPE] == "Спам"])
+legal_count  = len(df[df[COL_SENT] == "Legal Risk"])
+esc_count    = len(df[df[COL_OFFICE].str.contains("ГО", na=False)])
+fallback_count = len(df[df[COL_SOURCE] == "Fallback"])
 
-c1.metric("Всего тикетов", total)
-c2.metric("VIP + Priority", vip_count)
-c3.metric("🚨 Спам", spam_count)
-c4.metric("⚖️ Legal Risk", legal_count)
+c1.metric("Всего тикетов",     total)
+c2.metric("VIP + Priority",    vip_count)
+c3.metric("🚨 Спам",           spam_count)
+c4.metric("⚖️ Legal Risk",     legal_count)
 c5.metric("🔼 Эскалировано в ГО", esc_count)
-c6.metric("🔄 Keyword Fallback", fallback_count)
+c6.metric("🔄 Keyword Fallback",  fallback_count)
 
 # ─── ГРАФИКИ ──────────────────────────────────────────────────────────────────
 st.markdown("---")
@@ -67,29 +89,28 @@ col1, col2, col3 = st.columns(3)
 
 with col1:
     st.subheader("Типы обращений")
-    st.bar_chart(df["AI_Тип"].value_counts())
+    st.bar_chart(df[COL_TYPE].value_counts())
 
 with col2:
     st.subheader("Куда ушли тикеты")
-    st.bar_chart(df["Офис_назначения"].value_counts())
+    st.bar_chart(df[COL_OFFICE].value_counts())
 
 with col3:
     st.subheader("Уровни приоритета")
-    prio_colors = df["Приоритет_уровень"].value_counts()
-    st.bar_chart(prio_colors)
+    st.bar_chart(df["Приоритет_уровень"].value_counts())
 
 st.markdown("---")
 col4, col5 = st.columns(2)
 
 with col4:
     st.subheader("Нагрузка на менеджеров (топ-10)")
-    mgr_df = df[df["Назначенный_Менеджер"] != "Не найден"]
+    mgr_df = df[df[COL_MANAGER] != "Не найден"]
     if not mgr_df.empty:
-        st.bar_chart(mgr_df["Назначенный_Менеджер"].value_counts().head(10))
+        st.bar_chart(mgr_df[COL_MANAGER].value_counts().head(10))
 
 with col5:
     st.subheader("Причины роутинга")
-    st.bar_chart(df["Причина_роутинга"].value_counts())
+    st.bar_chart(df[COL_REASON].value_counts())
 
 # ─── ФИЛЬТРЫ + ТАБЛИЦА ────────────────────────────────────────────────────────
 st.markdown("---")
@@ -97,24 +118,19 @@ st.subheader("📋 Детализация распределения")
 
 cf1, cf2, cf3, cf4 = st.columns(4)
 with cf1:
-    f_city = st.multiselect("🏙️ Город", sorted(df["Город_оригинал"].dropna().unique()) if "Город_оригинал" in df.columns else [])
+    f_city = st.multiselect("🏙️ Город",          sorted(df[COL_CITY].dropna().unique()))
 with cf2:
-    f_type = st.multiselect("📌 Тип обращения", sorted(df["AI_Тип"].dropna().unique()))
+    f_type = st.multiselect("📌 Тип обращения",   sorted(df[COL_TYPE].dropna().unique()))
 with cf3:
-    f_prio = st.multiselect("🔥 Приоритет", ["High", "Medium", "Low"])
+    f_prio = st.multiselect("🔥 Приоритет",       ["High", "Medium", "Low"])
 with cf4:
-    f_seg = st.multiselect("👤 Сегмент", sorted(df["Сегмент"].dropna().unique()))
+    f_seg  = st.multiselect("👤 Сегмент",         sorted(df[COL_SEG].dropna().unique()))
 
 fdf = df.copy()
-city_col = "Город_оригинал" if "Город_оригинал" in df.columns else "Город"
-if f_city:
-    fdf = fdf[fdf[city_col].isin(f_city)]
-if f_type:
-    fdf = fdf[fdf["AI_Тип"].isin(f_type)]
-if f_prio:
-    fdf = fdf[fdf["Приоритет_уровень"].isin(f_prio)]
-if f_seg:
-    fdf = fdf[fdf["Сегмент"].isin(f_seg)]
+if f_city: fdf = fdf[fdf[COL_CITY].isin(f_city)]
+if f_type: fdf = fdf[fdf[COL_TYPE].isin(f_type)]
+if f_prio: fdf = fdf[fdf["Приоритет_уровень"].isin(f_prio)]
+if f_seg:  fdf = fdf[fdf[COL_SEG].isin(f_seg)]
 
 def highlight_row(row):
     styles = [""] * len(row)
@@ -122,29 +138,36 @@ def highlight_row(row):
     if "Приоритет_уровень" in idx:
         i = idx.index("Приоритет_уровень")
         v = row["Приоритет_уровень"]
-        styles[i] = "color: red; font-weight: bold" if v == "High" else "color: orange" if v == "Medium" else "color: green"
-    if "AI_Тональность" in idx and row["AI_Тональность"] == "Legal Risk":
-        styles[idx.index("AI_Тональность")] = "color: red; font-weight: bold"
-    if "Назначенный_Менеджер" in idx and row["Назначенный_Менеджер"] == "Не найден":
-        styles[idx.index("Назначенный_Менеджер")] = "background-color: #ffcccc"
-    if "Офис_назначения" in idx and "ГО" in str(row["Офис_назначения"]):
-        styles[idx.index("Офис_назначения")] = "color: #e67e22; font-weight: bold"
+        styles[i] = ("color: red; font-weight: bold" if v == "High"
+                     else "color: orange" if v == "Medium"
+                     else "color: green")
+    if COL_SENT in idx and row[COL_SENT] == "Legal Risk":
+        styles[idx.index(COL_SENT)] = "color: red; font-weight: bold"
+    if COL_MANAGER in idx and row[COL_MANAGER] == "Не найден":
+        styles[idx.index(COL_MANAGER)] = "background-color: #ffcccc"
+    if COL_OFFICE in idx and "ГО" in str(row[COL_OFFICE]):
+        styles[idx.index(COL_OFFICE)] = "color: #e67e22; font-weight: bold"
     return styles
 
 show_cols = [c for c in [
-    city_col, "Офис_назначения", "Сегмент", "AI_Тип", "AI_Тональность",
-    "AI_Язык", "AI_Приоритет", "Приоритет_уровень", "AI_Summary",
-    "Назначенный_Менеджер", "Должность", "Причина_роутинга", "AI_Источник"
+    COL_CITY, COL_OFFICE, COL_SEG, COL_TYPE, COL_SENT,
+    COL_LANG, COL_PRIO, "Приоритет_уровень", COL_SUMMARY,
+    COL_MANAGER, COL_ROLE, COL_REASON, COL_SOURCE
 ] if c in fdf.columns]
 
-st.dataframe(fdf[show_cols].style.apply(highlight_row, axis=1), use_container_width=True, height=450)
+st.dataframe(
+    fdf[show_cols].style.apply(highlight_row, axis=1),
+    use_container_width=True,
+    height=450
+)
 st.caption(f"Показано {len(fdf)} из {total} тикетов")
 
 # Блок эскалированных тикетов
-esc_df = df[df["Офис_назначения"].str.contains("ГО", na=False)]
+esc_df = df[df[COL_OFFICE].str.contains("ГО", na=False)]
 if not esc_df.empty:
-    with st.expander(f"🔼 Эскалированные тикеты ({len(esc_df)}шт) — нажмите для просмотра"):
-        esc_cols = [c for c in [city_col, "Сегмент", "AI_Тип", "AI_Приоритет", "Назначенный_Менеджер", "Офис_назначения"] if c in esc_df.columns]
+    with st.expander(f"🔼 Эскалированные тикеты ({len(esc_df)} шт) — нажмите для просмотра"):
+        esc_cols = [c for c in [COL_CITY, COL_SEG, COL_TYPE, COL_PRIO, COL_MANAGER, COL_OFFICE]
+                    if c in esc_df.columns]
         st.dataframe(esc_df[esc_cols], use_container_width=True)
 
 # ─── STAR TASK: AI АССИСТЕНТ ──────────────────────────────────────────────────
@@ -152,35 +175,30 @@ st.markdown("---")
 st.subheader("🤖 AI-Ассистент (Star Task)")
 st.markdown("Задайте вопрос по данным на естественном языке. Ассистент построит анализ и при необходимости сгенерирует график.")
 
-# Инициализация истории чата
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
 
-# Показываем историю сообщений
 for msg in st.session_state.chat_history:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
 
-# Поле ввода
 user_input = st.chat_input("Например: Покажи распределение типов обращений по городам")
 
 if user_input:
-    # Добавляем сообщение пользователя
     st.session_state.chat_history.append({"role": "user", "content": user_input})
     with st.chat_message("user"):
         st.markdown(user_input)
 
-    # Контекст для AI: статистика по датасету
     data_context = f"""
 Датасет FIRE Dashboard: {total} тикетов.
 Столбцы: {', '.join(df.columns.tolist())}
-Уникальные типы обращений: {df['AI_Тип'].value_counts().to_dict()}
-Тональности: {df['AI_Тональность'].value_counts().to_dict()}
-Офисы назначения: {df['Офис_назначения'].value_counts().to_dict()}
-Сегменты: {df['Сегмент'].value_counts().to_dict()}
-Уровни приоритета: {df['Приоритет_уровень'].value_counts().to_dict()}
-Менеджеры (топ-5): {df[df['Назначенный_Менеджер'] != 'Не найден']['Назначенный_Менеджер'].value_counts().head(5).to_dict()}
-    """.strip()
+Уникальные типы обращений: {df[COL_TYPE].value_counts().to_dict()}
+Тональности: {df[COL_SENT].value_counts().to_dict()}
+Офисы назначения: {df[COL_OFFICE].value_counts().to_dict()}
+Сегменты: {df[COL_SEG].value_counts().to_dict()}
+Уровни приоритета: {df["Приоритет_уровень"].value_counts().to_dict()}
+Менеджеры (топ-5): {df[df[COL_MANAGER] != 'Не найден'][COL_MANAGER].value_counts().head(5).to_dict()}
+""".strip()
 
     system_prompt = f"""Ты — аналитический AI-ассистент дашборда FIRE (Freedom Intelligent Routing Engine).
 Ты помогаешь операторам анализировать данные по тикетам клиентов.
@@ -192,7 +210,6 @@ if user_input:
 Если вопрос про графики/визуализацию — опиши выводы словами (у тебя нет доступа к Matplotlib, но дашборд уже показывает графики выше).
 Если вопрос — аналитический — дай конкретный ответ с цифрами из датасета."""
 
-    # Вызов Gemini API
     try:
         gemini_api_key = os.getenv("GEMINI_API_KEY", "")
         if not gemini_api_key:
@@ -201,9 +218,8 @@ if user_input:
             genai.configure(api_key=gemini_api_key)
             model = genai.GenerativeModel("gemma-3-27b-it")
 
-            # Собираем историю в формат Gemini
             history_for_gemini = []
-            for m in st.session_state.chat_history[:-1]:  # Без последнего (это новый вопрос)
+            for m in st.session_state.chat_history[:-1]:
                 role = "user" if m["role"] == "user" else "model"
                 history_for_gemini.append({"role": role, "parts": [m["content"]]})
 
@@ -213,12 +229,10 @@ if user_input:
     except Exception as e:
         answer = f"⚠️ Ошибка AI-ассистента: {str(e)}"
 
-    # Показываем ответ
     st.session_state.chat_history.append({"role": "assistant", "content": answer})
     with st.chat_message("assistant"):
         st.markdown(answer)
 
-# Примеры запросов
 with st.expander("💡 Примеры вопросов к ассистенту"):
     st.markdown("""
 - Сколько VIP-клиентов было эскалировано в главный офис?
