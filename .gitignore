@@ -1,2 +1,21 @@
 .env
+
+# Go
+*.exe
+*.test
+
+# Python
+__pycache__/
+*.pyc
+venv/
+.venv/
+
+# Результаты (генерируются автоматически)
+data/results.csv
+
+# IDE
+.vscode/
+.idea/
+.DS_Store
+
 fire-router
