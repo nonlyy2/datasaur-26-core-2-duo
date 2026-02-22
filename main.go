@@ -658,7 +658,7 @@ type ticketForPrompt struct {
 }
 
 func analyzeBatch(tickets []TicketInput, apiKey string) (map[int]AIResult, error) {
-	url := "https://generativelanguage.googleapis.com/v1beta/models/gemma-3-27b-it:generateContent?key=" + apiKey
+	url := "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=" + apiKey
 
 	officesList := strings.Join(knownOffices, " | ")
 
@@ -806,8 +806,9 @@ SUMMARY (поле "summary"):
 			{"parts": []map[string]any{{"text": prompt}}},
 		},
 		"generationConfig": map[string]any{
-			"temperature":     0.05,
-			"maxOutputTokens": 8192,
+			"temperature":      0.05,
+			"maxOutputTokens":  65536,
+			"responseMimeType": "application/json",
 		},
 	})
 
@@ -936,6 +937,43 @@ func analyzeBatchWithRetry(tickets []TicketInput, apiKey string, maxRetries int)
 		}
 	}
 	return nil, lastErr
+}
+
+// analyzeAllInChunks — разбивает тикеты на чанки по chunkSize и обрабатывает их последовательно.
+// Между чанками делает паузу pauseSec секунд чтобы не упираться в TPM rate limit.
+func analyzeAllInChunks(tickets []TicketInput, apiKey string, chunkSize, pauseSec int) (map[int]AIResult, error) {
+	allResults := make(map[int]AIResult)
+
+	for start := 0; start < len(tickets); start += chunkSize {
+		end := start + chunkSize
+		if end > len(tickets) {
+			end = len(tickets)
+		}
+		chunk := tickets[start:end]
+
+		fmt.Printf("📦 Чанк %d–%d из %d тикетов...\n", start+1, end, len(tickets))
+
+		results, err := analyzeBatchWithRetry(chunk, apiKey, 3)
+		if err != nil {
+			// Fallback для всего чанка
+			fmt.Printf("⚠️ Чанк %d–%d упал: %v → Keyword Fallback\n", start+1, end, err)
+			for _, t := range chunk {
+				allResults[t.Index] = fallbackAnalyze(t)
+			}
+		} else {
+			for k, v := range results {
+				allResults[k] = v
+			}
+		}
+
+		// Пауза между чанками (кроме последнего)
+		if end < len(tickets) {
+			fmt.Printf("⏸  Пауза %d сек перед следующим чанком...\n", pauseSec)
+			time.Sleep(time.Duration(pauseSec) * time.Second)
+		}
+	}
+
+	return allResults, nil
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -1290,24 +1328,15 @@ func processAllTickets(fp, apiKey string) {
 		writer.Flush()
 	}
 
-	// ── AI АНАЛИЗ (батч-запрос) ───────────────────────────────────
-	aiResults, batchErr := analyzeBatchWithRetry(tickets, apiKey, 3)
+	// ── AI АНАЛИЗ — чанками по 10 тикетов (избегаем TPM rate limit) ──
+	aiResults, _ := analyzeAllInChunks(tickets, apiKey, 10, 3)
 
-	if batchErr != nil {
-		fmt.Printf("⚠️ AI батч полностью упал: %v\n🔄 Keyword Fallback для всех тикетов\n", batchErr)
-		aiResults = make(map[int]AIResult)
-		for _, t := range tickets {
+	// Fallback для тикетов, которые AI пропустил
+	for _, t := range tickets {
+		if _, ok := aiResults[t.Index]; !ok {
+			fmt.Printf("   ⚠️ AI пропустил тикет %d (GUID %s) → Keyword Fallback\n",
+				t.Index, t.GUID[:min(8, len(t.GUID))])
 			aiResults[t.Index] = fallbackAnalyze(t)
-		}
-	} else {
-		// Fallback для тикетов, которые AI пропустил
-		for _, t := range tickets {
-			if _, ok := aiResults[t.Index]; !ok {
-				fmt.Printf("   ⚠️ AI пропустил тикет %d (GUID %s) → Keyword Fallback\n",
-					t.Index, t.GUID[:min(8, len(t.GUID))])
-				fb := fallbackAnalyze(t)
-				aiResults[t.Index] = fb
-			}
 		}
 	}
 
