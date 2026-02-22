@@ -1047,17 +1047,22 @@ func processAllTickets(fp, apiKey string) {
 	needHeader := true
 	outPath := "data/results.csv"
 
-	if existing, err := os.Open(outPath); err == nil {
-		rows, _ := csv.NewReader(existing).ReadAll()
-		existing.Close()
-		if len(rows) > 1 {
-			needHeader = false
-			for _, row := range rows[1:] {
-				if len(row) > 0 {
-					processedGUIDs[strings.TrimSpace(row[0])] = true
+	// Проверяем существование и содержимое файла
+	if info, err := os.Stat(outPath); err == nil && info.Size() > 0 {
+		// Файл существует и не пуст – заголовок уже есть, писать его повторно не нужно
+		needHeader = false
+		existing, err := os.Open(outPath)
+		if err == nil {
+			rows, _ := csv.NewReader(existing).ReadAll()
+			existing.Close()
+			if len(rows) > 1 {
+				for _, row := range rows[1:] {
+					if len(row) > 0 {
+						processedGUIDs[strings.TrimSpace(row[0])] = true
+					}
 				}
+				fmt.Printf("📂 Уже обработано: %d тикетов, обработаем только новые\n", len(processedGUIDs))
 			}
-			fmt.Printf("📂 Уже обработано: %d тикетов, обработаем только новые\n", len(processedGUIDs))
 		}
 	}
 
@@ -1366,7 +1371,7 @@ func main() {
 		log.Fatal("❌ GEMINI_API_KEY не установлен! Добавьте в .env или переменные окружения.")
 	}
 
-	fmt.Println("🔥 FIRE — Freedom Intelligent Routing Engine v6.0")
+	fmt.Println("🔥 FIRE — Freedom Intelligent Routing Engine v0.1.0")
 	fmt.Println("   ✅ Батч AI-анализ: 1 запрос на все тикеты")
 	fmt.Println("   ✅ AI-геолокация: LLM определяет офис (опечатки, транслитерация)")
 	fmt.Println("   ✅ Каскад фильтров: VIP → Смена данных → Язык → Round Robin")
