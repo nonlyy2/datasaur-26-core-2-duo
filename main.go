@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"database/sql"
 	"encoding/csv"
 	"encoding/json"
 	"fmt"
@@ -18,7 +17,6 @@ import (
 	"time"
 
 	"github.com/joho/godotenv"
-	_ "github.com/lib/pq"
 )
 
 // ═══════════════════════════════════════════════════════════
@@ -99,7 +97,6 @@ var (
 	foreignSplitCtr int
 	HQ_CITIES       = []string{"Астана", "Алматы"}
 	knownOffices    []string
-	db              *sql.DB
 
 	// OfficeCoords — координаты офисов для расчёта реального расстояния
 	OfficeCoords = map[string]GeoPoint{
@@ -120,186 +117,6 @@ var (
 		"Костанай":         {53.2141, 63.6324},
 	}
 )
-
-// ═══════════════════════════════════════════════════════════
-//  POSTGRESQL — ИНИЦИАЛИЗАЦИЯ И СХЕМА
-// ═══════════════════════════════════════════════════════════
-
-func initDB() {
-	connStr := os.Getenv("DATABASE_URL")
-	if connStr == "" {
-		host := getEnvDefault("DB_HOST", "localhost")
-		port := getEnvDefault("DB_PORT", "5432")
-		user := getEnvDefault("DB_USER", "postgres")
-		password := getEnvDefault("DB_PASSWORD", "postgres")
-		dbname := getEnvDefault("DB_NAME", "fire_db")
-		connStr = fmt.Sprintf(
-			"host=%s port=%s user=%s password=%s dbname=%s sslmode=disable",
-			host, port, user, password, dbname,
-		)
-	}
-
-	var err error
-	db, err = sql.Open("postgres", connStr)
-	if err != nil {
-		log.Printf("⚠️ PostgreSQL: не удалось открыть соединение: %v", err)
-		db = nil
-		return
-	}
-	if err = db.Ping(); err != nil {
-		log.Printf("⚠️ PostgreSQL: нет соединения: %v", err)
-		db = nil
-		return
-	}
-	fmt.Println("✅ PostgreSQL: подключено")
-	createSchema()
-}
-
-func createSchema() {
-	schema := `
--- Основные тикеты (входные данные)
-CREATE TABLE IF NOT EXISTS tickets (
-    guid          VARCHAR(255) PRIMARY KEY,
-    gender        VARCHAR(20),
-    birthdate     VARCHAR(30),
-    description   TEXT,
-    attachment    VARCHAR(500),
-    segment       VARCHAR(50),
-    country       VARCHAR(100),
-    oblast        VARCHAR(200),
-    city          VARCHAR(200),
-    street        VARCHAR(300),
-    house         VARCHAR(50),
-    created_at    TIMESTAMP DEFAULT NOW()
-);
-
--- AI-анализ каждого тикета (связь 1:1 с tickets)
-CREATE TABLE IF NOT EXISTS ai_analysis (
-    guid           VARCHAR(255) PRIMARY KEY REFERENCES tickets(guid) ON DELETE CASCADE,
-    type           VARCHAR(100),
-    sentiment      VARCHAR(50),
-    language       VARCHAR(10),
-    priority       INTEGER,
-    summary        TEXT,
-    source         VARCHAR(50),
-    nearest_office VARCHAR(100),
-    geo_lat        DOUBLE PRECISION,
-    geo_lon        DOUBLE PRECISION,
-    geo_method     VARCHAR(20),
-    analyzed_at    TIMESTAMP DEFAULT NOW()
-);
-
--- Результат роутинга (связь 1:1 с tickets)
-CREATE TABLE IF NOT EXISTS routing_results (
-    guid            VARCHAR(255) PRIMARY KEY REFERENCES tickets(guid) ON DELETE CASCADE,
-    manager_name    VARCHAR(255),
-    manager_role    VARCHAR(100),
-    assigned_office VARCHAR(100),
-    is_escalated    BOOLEAN DEFAULT FALSE,
-    routing_reason  TEXT,
-    city_original   VARCHAR(200),
-    routed_at       TIMESTAMP DEFAULT NOW()
-);
-
--- Миграция: добавляем колонки если таблица уже существовала без них
-ALTER TABLE routing_results ADD COLUMN IF NOT EXISTS is_escalated   BOOLEAN DEFAULT FALSE;
-ALTER TABLE routing_results ADD COLUMN IF NOT EXISTS routing_reason TEXT;
-ALTER TABLE routing_results ADD COLUMN IF NOT EXISTS city_original  VARCHAR(200);
-
--- Представление для удобного просмотра всей цепочки
-CREATE OR REPLACE VIEW v_full_results AS
-SELECT
-    t.guid,
-    t.city,
-    r.city_original,
-    t.segment,
-    t.description,
-    a.type        AS ai_type,
-    a.sentiment   AS ai_sentiment,
-    a.language    AS ai_language,
-    a.priority    AS ai_priority,
-    a.summary     AS ai_summary,
-    a.source      AS ai_source,
-    a.geo_method  AS geo_method,
-    r.manager_name,
-    r.manager_role,
-    r.assigned_office,
-    r.is_escalated,
-    r.routing_reason
-FROM tickets t
-LEFT JOIN ai_analysis a ON a.guid = t.guid
-LEFT JOIN routing_results r ON r.guid = t.guid;
-`
-	if _, err := db.Exec(schema); err != nil {
-		log.Printf("⚠️ Ошибка создания схемы: %v", err)
-	} else {
-		fmt.Println("✅ PostgreSQL: схема готова (tickets → ai_analysis → routing_results + view)")
-	}
-}
-
-func saveTicketToDB(t TicketInput) {
-	if db == nil {
-		return
-	}
-	_, err := db.Exec(`
-		INSERT INTO tickets (guid, gender, birthdate, description, attachment, segment, country, oblast, city, street, house)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
-		ON CONFLICT (guid) DO NOTHING`,
-		t.GUID, t.Gender, t.Birthdate, t.Text, t.Attachment,
-		t.Segment, t.Country, t.Oblast, t.RawCity, t.Street, t.House,
-	)
-	if err != nil {
-		log.Printf("⚠️ DB tickets insert %s: %v", t.GUID[:min(8, len(t.GUID))], err)
-	}
-}
-
-func saveAIResultToDB(guid string, ai AIResult) {
-	if db == nil {
-		return
-	}
-	priority, _ := strconv.Atoi(ai.Priority)
-	var lat, lon any
-	if ai.GeoLat != 0 || ai.GeoLon != 0 {
-		lat, lon = ai.GeoLat, ai.GeoLon
-	}
-	_, err := db.Exec(`
-		INSERT INTO ai_analysis (guid, type, sentiment, language, priority, summary, source, nearest_office, geo_lat, geo_lon, geo_method)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
-		ON CONFLICT (guid) DO UPDATE SET
-			type=EXCLUDED.type, sentiment=EXCLUDED.sentiment, language=EXCLUDED.language,
-			priority=EXCLUDED.priority, summary=EXCLUDED.summary, source=EXCLUDED.source,
-			nearest_office=EXCLUDED.nearest_office, geo_lat=EXCLUDED.geo_lat,
-			geo_lon=EXCLUDED.geo_lon, geo_method=EXCLUDED.geo_method`,
-		guid, ai.Type, ai.Sentiment, ai.Language, priority, ai.Summary, ai.Source, ai.NearestOffice,
-		lat, lon, ai.GeoMethod,
-	)
-	if err != nil {
-		log.Printf("⚠️ DB ai_analysis insert %s: %v", guid[:min(8, len(guid))], err)
-	}
-}
-
-func saveRoutingToDB(guid string, r RoutingResult) {
-	if db == nil {
-		return
-	}
-	_, err := db.Exec(`
-		INSERT INTO routing_results (guid, manager_name, manager_role, assigned_office, is_escalated, routing_reason, city_original)
-		VALUES ($1,$2,$3,$4,$5,$6,$7)
-		ON CONFLICT (guid) DO UPDATE SET
-			manager_name=EXCLUDED.manager_name, manager_role=EXCLUDED.manager_role,
-			assigned_office=EXCLUDED.assigned_office, is_escalated=EXCLUDED.is_escalated,
-			routing_reason=EXCLUDED.routing_reason, city_original=EXCLUDED.city_original`,
-		guid, r.ManagerName, r.ManagerRole, r.AssignedOffice,
-		r.IsEscalated, r.RoutingReason, r.CityOriginal,
-	)
-	if err != nil {
-		log.Printf("⚠️ DB routing_results insert %s: %v", guid[:min(8, len(guid))], err)
-	}
-}
-
-// ═══════════════════════════════════════════════════════════
-//  ЗАГРУЗКА CSV ДАННЫХ
-// ═══════════════════════════════════════════════════════════
 
 func loadOffices(fp string) {
 	file, err := os.Open(fp)
@@ -369,13 +186,6 @@ func loadManagers(fp string) {
 // ═══════════════════════════════════════════════════════════
 //  ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 // ═══════════════════════════════════════════════════════════
-
-func getEnvDefault(key, def string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return def
-}
 
 func isHighPriority(priority string) bool {
 	p, err := strconv.Atoi(strings.TrimSpace(priority))
@@ -1360,7 +1170,6 @@ func processAllTickets(fp, apiKey string) {
 	fmt.Println(strings.Repeat("─", 70))
 
 	var allResults []RoutingResult
-	var dbWg sync.WaitGroup // DB saves идут асинхронно, не блокируя CSV
 
 	for _, t := range tickets {
 		ai := aiResults[t.Index]
@@ -1429,15 +1238,6 @@ func processAllTickets(fp, apiKey string) {
 
 		allResults = append(allResults, routingResult)
 
-		// ── Async DB save: не блокируем роутинг следующего тикета ────
-		dbWg.Add(1)
-		go func(ticket TicketInput, aiSnap AIResult, rr RoutingResult) {
-			defer dbWg.Done()
-			saveTicketToDB(ticket)
-			saveAIResultToDB(ticket.GUID, aiSnap)
-			saveRoutingToDB(ticket.GUID, rr)
-		}(t, ai, routingResult)
-
 		// ── CSV write (последовательно — порядок важен) ───────────────
 		escalatedStr := "Нет"
 		if routingResult.IsEscalated {
@@ -1462,8 +1262,6 @@ func processAllTickets(fp, apiKey string) {
 		})
 		writer.Flush()
 	}
-
-	dbWg.Wait() // Ждём завершения всех DB-горутин перед выходом
 
 	// ── Итоговая статистика ───────────────────────────────────────
 	printSummary(allResults)
@@ -1543,7 +1341,6 @@ func main() {
 	fmt.Println("   ✅ Каскад фильтров: VIP → Смена данных → Язык → Round Robin")
 	fmt.Println("   ✅ Спам: аналитика без назначения")
 	fmt.Println("   ✅ Иностранные клиенты: 50/50 Астана/Алматы")
-	fmt.Println("   ✅ PostgreSQL: tickets → ai_analysis → routing_results")
 	fmt.Println("   ✅ CSV: колонки совместимы с app.py")
 	fmt.Println()
 
@@ -1555,9 +1352,6 @@ func main() {
 	// Загружаем данные
 	loadOffices(officesPath)
 	loadManagers(managersPath)
-
-	// Подключаемся к PostgreSQL (опционально, не блокирует работу)
-	initDB()
 
 	// Диагностика VIP-покрытия
 	fmt.Println("\n--- VIP-покрытие по офисам ---")
@@ -1583,10 +1377,6 @@ func main() {
 	// Основная обработка
 	processAllTickets(ticketsPath, apiKey)
 
-	// Закрываем соединение с БД
-	if db != nil {
-		db.Close()
-	}
 }
 
 // findFile — ищет файл в нескольких вариантах пути
@@ -1598,4 +1388,11 @@ func findFile(paths ...string) string {
 	}
 	// Если не найден, возвращаем первый путь (выдаст ошибку при открытии)
 	return paths[0]
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
