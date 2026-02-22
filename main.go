@@ -1142,6 +1142,7 @@ func processAllTickets(fp, apiKey string) {
 			"Язык",
 			"Приоритет",
 			"Рекомендации менеджеру",
+			"Вложения",
 			"Назначенный Менеджер",
 			"Должность",
 			"Офис Назначения",
@@ -1233,10 +1234,10 @@ func processAllTickets(fp, apiKey string) {
 				fmt.Printf("   ❌ Менеджер не найден\n")
 			}
 
-			// При эскалации в ГО добавляем суффикс для app.py (фильтр по "ГО")
+			// Эскалация
 			displayOffice := assignedOffice
 			if isEscalated {
-				displayOffice = assignedOffice + " (ГО)"
+				displayOffice = assignedOffice
 			}
 			routingResult = RoutingResult{
 				GUID:           t.GUID,
@@ -1264,6 +1265,14 @@ func processAllTickets(fp, apiKey string) {
 		if routingResult.IsEscalated {
 			escalatedStr = "Да"
 		}
+
+		// --- ПРОВЕРЯЕМ ВЛОЖЕНИЕ ДЛЯ ТЕКУЩЕГО ТИКЕТА ---
+		attachOutput := t.Attachment
+		if strings.TrimSpace(attachOutput) == "" {
+			attachOutput = "—"
+		}
+		// -------------------------------------------------
+
 		writer.Write([]string{
 			routingResult.GUID,
 			routingResult.Segment,
@@ -1272,6 +1281,7 @@ func processAllTickets(fp, apiKey string) {
 			routingResult.Language,
 			routingResult.Priority,
 			routingResult.Summary,
+			attachOutput,
 			routingResult.ManagerName,
 			routingResult.ManagerRole,
 			routingResult.AssignedOffice,
