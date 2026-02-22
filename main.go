@@ -795,8 +795,8 @@ func findBestManager(pool []*Manager, segment string, ai AIResult, officeKey str
 	var filtered []*Manager
 
 	for _, m := range pool {
-		// ── Фильтр 1: VIP/Priority сегмент ИЛИ высокий приоритет → нужен навык VIP
-		if needsVIP(segment) || isHighPriority(ai.Priority) {
+		// ── Фильтр 1: VIP/Priority сегмент → нужен навык VIP (строго по ТЗ: только сегмент)
+		if needsVIP(segment) {
 			hasVIP := false
 			for _, s := range m.Skills {
 				if strings.TrimSpace(s) == "VIP" {
@@ -920,8 +920,8 @@ func routeTicket(t TicketInput, ai AIResult) (*Manager, string, bool) {
 // buildNoMatchReason — формирует читаемую причину отсутствия подходящего менеджера
 func buildNoMatchReason(segment string, ai AIResult) string {
 	var reasons []string
-	if needsVIP(segment) || isHighPriority(ai.Priority) {
-		reasons = append(reasons, "нужен VIP")
+	if needsVIP(segment) {
+		reasons = append(reasons, "нужен VIP (сегмент)")
 	}
 	if ai.Type == "Смена данных" {
 		reasons = append(reasons, "нужен Главный специалист")
@@ -1105,6 +1105,22 @@ func processAllTickets(fp, apiKey string) {
 	}
 	fmt.Printf("\n🚀 Новых тикетов для обработки: %d\n", len(tickets))
 
+	// ── ФИЧА: Обнаружение дублирующихся GUID в текущем батче ──────
+	guidCount := make(map[string][]int) // GUID → список индексов
+	for _, t := range tickets {
+		guidCount[t.GUID] = append(guidCount[t.GUID], t.Index)
+	}
+	for guid, indices := range guidCount {
+		if len(indices) > 1 {
+			shortGUID := guid
+			if len(guid) > 8 {
+				shortGUID = guid[:8]
+			}
+			fmt.Printf("⚠️  ДУБЛИКАТ: клиент %s прислал %d обращений в одном батче (индексы: %v) — возможен бот или технический сбой\n",
+				shortGUID, len(indices), indices)
+		}
+	}
+
 	// ── Открываем выходной файл ───────────────────────────────────
 	os.MkdirAll("data", 0755)
 	outFile, err := os.OpenFile(outPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
@@ -1217,6 +1233,11 @@ func processAllTickets(fp, apiKey string) {
 				fmt.Printf("   ❌ Менеджер не найден\n")
 			}
 
+			// При эскалации в ГО добавляем суффикс для app.py (фильтр по "ГО")
+			displayOffice := assignedOffice
+			if isEscalated {
+				displayOffice = assignedOffice + " (ГО)"
+			}
 			routingResult = RoutingResult{
 				GUID:           t.GUID,
 				CityOriginal:   t.RawCity,
@@ -1228,7 +1249,7 @@ func processAllTickets(fp, apiKey string) {
 				Summary:        ai.Summary,
 				ManagerName:    managerName,
 				ManagerRole:    managerRole,
-				AssignedOffice: assignedOffice,
+				AssignedOffice: displayOffice,
 				RoutingReason:  routingReason,
 				GeoMethod:      ai.GeoMethod,
 				Source:         ai.Source,
